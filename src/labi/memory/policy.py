@@ -1,5 +1,5 @@
 
-from zeroedge.core.config import Config
+from labi.core.config import Config
 
 class MemoryDecisionPolicy:
     def __init__(self, config=None):

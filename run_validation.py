@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ZeroEdgeAI ZER Runtime -- Validation Benchmark
+Labi -- Validation Benchmark
 
 Unlike the earlier version of this script, every task here is actually
-*executed* (sandboxed, via zeroedge.agent.execute_code) and its real
+*executed* (sandboxed, via labi.agent.execute_code) and its real
 pass/fail is what gets recorded -- "success" here means the generated
 code ran and exited 0, not "the LLM call didn't throw."
 """
@@ -20,7 +20,7 @@ from litellm.exceptions import RateLimitError
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from zeroedge.agent import extract_code, execute_code  # noqa: E402
+from labi.agent import extract_code, execute_code  # noqa: E402
 
 load_dotenv()
 
@@ -153,7 +153,7 @@ def run_task(db, goal, first_run=True):
 
 
 def benchmark():
-    print("ZeroEdgeAI ZER Runtime - Validation")
+    print("Labi - Validation")
     print("=" * 50)
 
     db = SimpleMemoryDB(DB_PATH)

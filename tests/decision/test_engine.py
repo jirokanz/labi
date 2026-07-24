@@ -1,11 +1,11 @@
 """DecisionEngine test harness.""" 
 
 import pytest
-from zeroedge.decision.engine import DecisionEngine
-from zeroedge.decision.types import ExecutionAction, ExecutionPlan
-from zeroedge.decision.validator import validate_plan, ExecutionPlanError
-from zeroedge.intelligence.types import TaskProfile, ReuseDecision, TaskCategory, RiskLevel, RecommendedStrategy
-from zeroedge.intelligence.trace import DecisionTrace
+from labi.decision.engine import DecisionEngine
+from labi.decision.types import ExecutionAction, ExecutionPlan
+from labi.decision.validator import validate_plan, ExecutionPlanError
+from labi.intelligence.types import TaskProfile, ReuseDecision, TaskCategory, RiskLevel, RecommendedStrategy
+from labi.intelligence.trace import DecisionTrace
 
 engine = DecisionEngine()
 

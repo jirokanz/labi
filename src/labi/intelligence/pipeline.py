@@ -2,11 +2,11 @@
 
 from dataclasses import dataclass
 
-from zeroedge.intelligence.classifier import TaskClassifier
-from zeroedge.intelligence.types import TaskProfile, ReuseDecision
-from zeroedge.memory.router import MemoryRouter
-from zeroedge.decision.engine import DecisionEngine
-from zeroedge.decision.types import ExecutionPlan
+from labi.intelligence.classifier import TaskClassifier
+from labi.intelligence.types import TaskProfile, ReuseDecision
+from labi.memory.router import MemoryRouter
+from labi.decision.engine import DecisionEngine
+from labi.decision.types import ExecutionPlan
 
 @dataclass
 class IntelligenceResult:

@@ -1,7 +1,7 @@
 """Test ExecutionDispatcher.""" 
 
-from zeroedge.execution.dispatcher import ExecutionDispatcher
-from zeroedge.decision.types import ExecutionAction, ExecutionPlan
+from labi.execution.dispatcher import ExecutionDispatcher
+from labi.decision.types import ExecutionAction, ExecutionPlan
 
 def test_dispatcher_memory():
     plan = ExecutionPlan(ExecutionAction.EXECUTE_MEMORY, None, "mem", False, False, False, "x")

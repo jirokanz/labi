@@ -1,6 +1,6 @@
-"""ZER Runtime version management."""
+"""Labi version management."""
 
-ZER_VERSION = "0.2.0"
+LABI_VERSION = "0.2.0"
 
 def get_major_version(version: str) -> str:
     """Extract major version (e.g., '0.2.0' → '0')."""

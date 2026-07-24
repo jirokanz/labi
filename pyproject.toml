@@ -3,10 +3,10 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zeroedge-runtime"
+name = "labi"
 version = "0.1.0"
-description = "ZeroEdgeAI Autonomous Edge Agent Runtime"
-authors = [{name = "ZeroEdgeAI Team"}]
+description = "Labi -- Autonomous Edge Agent Runtime"
+authors = [{name = "Labi Team"}]
 license = {text = "MIT"}
 dependencies = [
     "pydantic>=2.0",
@@ -18,8 +18,8 @@ dependencies = [
 ]
 
 [project.scripts]
-zer = "zeroedge.cli:main"
-zer-benchmark = "zeroedge.benchmark.run:main"
+labi = "labi.cli:main"
+labi-benchmark = "labi.benchmark.run:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict
 
-from zeroedge.decision.types import ExecutionPlan
+from labi.decision.types import ExecutionPlan
 
 class BaseExecutor(ABC):
     @abstractmethod

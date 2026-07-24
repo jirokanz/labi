@@ -1,14 +1,14 @@
 
 import time
-from zeroedge.memory.database import MemoryDatabase
-from zeroedge.memory.router import MemoryRouter
-from zeroedge.memory.confidence import ConfidenceEvaluator
-from zeroedge.memory.policy import MemoryDecisionPolicy
-from zeroedge.memory.guard import ReplayGuard
-from zeroedge.core.logger import Logger
+from labi.memory.database import MemoryDatabase
+from labi.memory.router import MemoryRouter
+from labi.memory.confidence import ConfidenceEvaluator
+from labi.memory.policy import MemoryDecisionPolicy
+from labi.memory.guard import ReplayGuard
+from labi.core.logger import Logger
 
 def main():
-    print("ZeroEdgeAI Benchmark (Real Memory Router)")
+    print("Labi Benchmark (Real Memory Router)")
     logger = Logger()
     db = MemoryDatabase(":memory:")
     evaluator = ConfidenceEvaluator()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZeroEdgeAI ZER Runtime -- Interactive Autonomous Agent.
+Labi -- Interactive Autonomous Agent.
 
 Loop: plan -> generate code -> show it -> you approve / edit / give feedback
 -> execute (sandboxed) -> auto-fix on failure -> save to memory for replay.
@@ -34,16 +34,16 @@ litellm.set_verbose = False
 import logging
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-from zeroedge.tools.python.security import validate_code as static_validate_code
-from zeroedge.tools.python.limits import make_preexec_fn, enforce_output_limit
-from zeroedge.intelligence.classifier import TaskClassifier
-from zeroedge.intelligence.types import RiskLevel
+from labi.tools.python.security import validate_code as static_validate_code
+from labi.tools.python.limits import make_preexec_fn, enforce_output_limit
+from labi.intelligence.classifier import TaskClassifier
+from labi.intelligence.types import RiskLevel
 
 load_dotenv()
 
 # ---------- Configuration ----------
-DB_PATH = os.getenv("ZER_DB_PATH", "memory.db")
-WORKSPACE_ROOT = Path.home() / "zer-runtime" / "workspace"
+DB_PATH = os.getenv("LABI_DB_PATH", "memory.db")
+WORKSPACE_ROOT = Path.home() / "labi" / "workspace"
 MAX_FIX_ATTEMPTS = 3
 EXECUTION_TIMEOUT = 20
 MAX_OUTPUT_BYTES = 1_048_576
@@ -253,6 +253,15 @@ class MemoryDB:
                 PRIMARY KEY (provider, capability)
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_usage (
+                provider TEXT,
+                day TEXT,
+                requests INTEGER DEFAULT 0,
+                tokens INTEGER DEFAULT 0,
+                PRIMARY KEY (provider, day)
+            )
+        """)
         self.conn.commit()
         self._migrate()
 
@@ -310,6 +319,30 @@ class MemoryDB:
              "total_latency_ms": r[4], "total_cost_usd": r[5] or 0.0}
             for r in cur.fetchall()
         ]
+
+    def record_daily_usage(self, provider, tokens, requests=1, day=None):
+        day = day or datetime.utcnow().strftime("%Y-%m-%d")
+        self.conn.execute(
+            "INSERT INTO daily_usage (provider, day, requests, tokens) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(provider, day) DO UPDATE SET "
+            "requests = requests + ?, tokens = tokens + ?",
+            (provider, day, requests, tokens, requests, tokens),
+        )
+        self.conn.commit()
+
+    def get_daily_usage(self, provider, day=None):
+        day = day or datetime.utcnow().strftime("%Y-%m-%d")
+        cur = self.conn.execute(
+            "SELECT requests, tokens FROM daily_usage WHERE provider=? AND day=?",
+            (provider, day),
+        )
+        row = cur.fetchone()
+        return {"requests": row[0], "tokens": row[1]} if row else {"requests": 0, "tokens": 0}
+
+    def get_all_daily_usage(self, day=None):
+        day = day or datetime.utcnow().strftime("%Y-%m-%d")
+        cur = self.conn.execute("SELECT provider, requests, tokens FROM daily_usage WHERE day=?", (day,))
+        return {r[0]: {"requests": r[1], "tokens": r[2]} for r in cur.fetchall()}
 
     def find_similar(self, goal):
         words = set(goal.lower().split())
@@ -524,21 +557,28 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
     finally:
         latency_ms = (time.monotonic() - start) * 1000
         cost = 0.0
+        total_tokens = 0
         if success:
+            full_prompt = f"{system_prompt}\n{prompt}" if system_prompt else prompt
             try:
                 # completion_cost estimates tokens from the raw text when no
                 # usage object is available (true for our manual streaming
                 # accumulation). Models litellm has no pricing data for
                 # raise/return 0 here -- that means "unknown", not "free".
-                full_prompt = f"{system_prompt}\n{prompt}" if system_prompt else prompt
                 cost = litellm.completion_cost(model=provider.model, prompt=full_prompt, completion=output_text) or 0.0
             except Exception:
                 cost = 0.0
+            try:
+                total_tokens = (litellm.token_counter(model=provider.model, text=full_prompt)
+                                 + litellm.token_counter(model=provider.model, text=output_text))
+            except Exception:
+                total_tokens = 0
         if cost_tracker is not None:
             cost_tracker.add(cost)
         if memory_db is not None and capability is not None:
             try:
                 memory_db.record_provider_call(provider.name, capability, success, latency_ms, cost_usd=cost)
+                memory_db.record_daily_usage(provider.name, tokens=total_tokens, requests=1)
             except Exception:
                 pass  # stats tracking should never break the actual task
 
@@ -725,6 +765,61 @@ def pick_cerebras_model(api_key, fetch_fn=_fetch_cerebras_models):
     return model_ids[0]
 
 
+# Best-effort published free-tier limits, as verified at the time these
+# providers were added to this file. These are NOT queried live -- we've
+# already been burned repeatedly by providers changing things without
+# notice (model catalogs, retirements), so treat these numbers as "last
+# known good", not gospel. Re-verify against the provider's own docs if
+# a number here looks suspiciously stale or a quota-based prediction
+# doesn't match what you're actually seeing.
+KNOWN_QUOTAS = {
+    "groq": {"requests_per_day": 1000, "requests_per_minute": 30},
+    "gemini": {"requests_per_day": 1500, "requests_per_minute": 15},
+    "mistral": {"requests_per_day": None, "requests_per_minute": 1},  # "prototyping only" tier, RPM-limited
+    "cerebras": {"requests_per_day": None, "requests_per_minute": None},  # catalog + limits both known to shift
+    "openrouter": {"requests_per_day": None, "requests_per_minute": None},  # varies per free model, not fixed
+}
+
+
+def compute_quota_status(provider_name, usage, quotas=KNOWN_QUOTAS):
+    """Pure function (no I/O) so it's directly testable: given today's
+    usage {"requests": N, "tokens": M} and the known daily request limit
+    for a provider, return remaining/used/pct, or None if no published
+    daily limit is tracked for that provider."""
+    quota = quotas.get(provider_name)
+    if not quota or not quota.get("requests_per_day"):
+        return None
+    limit = quota["requests_per_day"]
+    used = usage.get("requests", 0)
+    remaining = max(limit - used, 0)
+    pct_used = round((used / limit) * 100, 1) if limit else 0.0
+    return {"limit": limit, "used": used, "remaining": remaining, "pct_used": pct_used}
+
+
+def print_quota_summary(memory_db):
+    from datetime import datetime as _dt, timezone as _tz
+    usage_today = memory_db.get_all_daily_usage()
+    now = _dt.now(_tz.utc)
+    hours_to_reset = 24 - now.hour - (now.minute / 60)
+    print(f"\n{_c('Today’s usage (resets ~' + f'{hours_to_reset:.1f}h at UTC midnight):', 'bold')}")
+    if not usage_today:
+        print("  (no calls recorded today)")
+        return
+    for provider, usage in sorted(usage_today.items()):
+        status = compute_quota_status(provider, usage)
+        if status:
+            bar_len = 20
+            filled = int(bar_len * status["pct_used"] / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            color = "red" if status["pct_used"] >= 90 else ("yellow" if status["pct_used"] >= 70 else "green")
+            print(f"  {provider:12s} {_c(bar, color)} {status['used']}/{status['limit']} requests "
+                  f"({status['pct_used']}%) -- ~{usage['tokens']:,} tokens today")
+        else:
+            print(f"  {provider:12s} {usage['requests']} requests, ~{usage['tokens']:,} tokens today "
+                  f"{_c('(no published daily limit tracked)', 'grey')}")
+    print(_c("\n  Note: limits are last-known-good, not live-verified -- see KNOWN_QUOTAS in agent.py.", "grey"))
+
+
 def build_registry():
     registry = ProviderRegistry()
 
@@ -851,7 +946,7 @@ def is_question_or_followup(goal, session):
 
 
 def main():
-    print("\nZeroEdgeAI ZER Runtime -- Interactive Agent\n")
+    print("\nLabi -- Interactive Agent\n")
 
     registry = build_registry()
     print(f"Registered {len(registry.providers)} providers:")
@@ -865,7 +960,7 @@ def main():
     session = SessionContext()
 
     while True:
-        goal = input("\nYour goal/question (or 'exit', 'providers', 'reset', 'cost'): ").strip()
+        goal = input("\nYour goal/question (or 'exit', 'providers', 'reset', 'cost', 'quota'): ").strip()
         if not goal:
             continue
         if goal.lower() in ("exit", "quit"):
@@ -880,6 +975,9 @@ def main():
             continue
         if goal.lower() == "cost":
             print_cost_summary(memory_db)
+            continue
+        if goal.lower() == "quota":
+            print_quota_summary(memory_db)
             continue
 
         task_id = f"task_{uuid.uuid4().hex[:8]}"

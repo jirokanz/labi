@@ -1,6 +1,6 @@
 
 import re
-from zeroedge.core.config import Config
+from labi.core.config import Config
 
 class ConfidenceEvaluator:
     def __init__(self, config=None):

@@ -3,7 +3,7 @@ import sys
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="zer", description="ZeroEdgeAI ZER Runtime")
+    parser = argparse.ArgumentParser(prog="labi", description="Labi")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="Start the interactive autonomous agent (default)")
     sub.add_parser("demo", help="Run the small routing-decision demo")
@@ -13,13 +13,13 @@ def main(argv=None):
     command = args.command or "run"
 
     if command == "run":
-        from zeroedge.agent import main as agent_main
+        from labi.agent import main as agent_main
         agent_main()
     elif command == "demo":
-        from zeroedge.runtime import main as demo_main
+        from labi.runtime import main as demo_main
         demo_main()
     elif command == "benchmark":
-        from zeroedge.benchmark.run import main as benchmark_main
+        from labi.benchmark.run import main as benchmark_main
         benchmark_main()
 
 

@@ -1,7 +1,7 @@
 """DecisionEngine - Maps profile + decision to execution plan.""" 
 
-from zeroedge.intelligence.types import TaskProfile, ReuseDecision, RecommendedStrategy, RiskLevel
-from zeroedge.decision.types import ExecutionAction, ExecutionPlan
+from labi.intelligence.types import TaskProfile, ReuseDecision, RecommendedStrategy, RiskLevel
+from labi.decision.types import ExecutionAction, ExecutionPlan
 
 class DecisionEngine:
     def decide(self, profile: TaskProfile, reuse_decision: ReuseDecision) -> ExecutionPlan:

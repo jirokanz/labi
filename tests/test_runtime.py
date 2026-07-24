@@ -3,14 +3,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from zeroedge.runtime import main
-from zeroedge.tools.python.security import validate_code
-from zeroedge.tools.python.limits import make_preexec_fn, enforce_output_limit
-from zeroedge.workspace.manager import WorkspaceManager
-from zeroedge.memory.database import MemoryDatabase
-from zeroedge.memory.guard import ReplayGuard
-from zeroedge.replay.manager import ReplayManager
-from zeroedge.core.logger import Logger
+from labi.runtime import main
+from labi.tools.python.security import validate_code
+from labi.tools.python.limits import make_preexec_fn, enforce_output_limit
+from labi.workspace.manager import WorkspaceManager
+from labi.memory.database import MemoryDatabase
+from labi.memory.guard import ReplayGuard
+from labi.replay.manager import ReplayManager
+from labi.core.logger import Logger
 
 
 def test_import():
@@ -126,7 +126,7 @@ def test_replay_guard_allows_within_depth():
 # ---- config.py (previously always empty regardless of config_path) ----
 
 def test_config_loads_yaml(tmp_path):
-    from zeroedge.core.config import Config
+    from labi.core.config import Config
     config_file = tmp_path / "config.yaml"
     config_file.write_text("memory:\n  thresholds:\n    reuse: 0.9\n")
     cfg = Config(str(config_file))
@@ -135,7 +135,7 @@ def test_config_loads_yaml(tmp_path):
 
 
 def test_config_missing_file_falls_back_to_default():
-    from zeroedge.core.config import Config
+    from labi.core.config import Config
     cfg = Config("/nonexistent/path.yaml")
     assert cfg.get("anything", "fallback") == "fallback"
 
@@ -143,7 +143,7 @@ def test_config_missing_file_falls_back_to_default():
 # ---- adaptive provider ranking (was static priority only, never updated) ----
 
 def test_provider_stats_recorded_and_retrieved(tmp_path):
-    from zeroedge.agent import MemoryDB
+    from labi.agent import MemoryDB
     db = MemoryDB(str(tmp_path / "mem.db"))
     db.record_provider_call("groq", "coding", True, 500)
     db.record_provider_call("groq", "coding", True, 700)
@@ -155,7 +155,7 @@ def test_provider_stats_recorded_and_retrieved(tmp_path):
 
 
 def test_registry_falls_back_to_static_priority_below_min_samples(tmp_path):
-    from zeroedge.agent import MemoryDB, BaseProvider, ProviderRegistry
+    from labi.agent import MemoryDB, BaseProvider, ProviderRegistry
     db = MemoryDB(str(tmp_path / "mem.db"))
     registry = ProviderRegistry()
     fast_but_new = BaseProvider("fast", "m", "", "k", ["coding"], priority=50)
@@ -170,7 +170,7 @@ def test_registry_falls_back_to_static_priority_below_min_samples(tmp_path):
 
 
 def test_registry_prefers_measured_success_once_enough_samples(tmp_path):
-    from zeroedge.agent import MemoryDB, BaseProvider, ProviderRegistry
+    from labi.agent import MemoryDB, BaseProvider, ProviderRegistry
     db = MemoryDB(str(tmp_path / "mem.db"))
     registry = ProviderRegistry()
     unreliable_but_prioritized = BaseProvider("unreliable", "m", "", "k", ["coding"], priority=10)
@@ -188,7 +188,7 @@ def test_registry_prefers_measured_success_once_enough_samples(tmp_path):
 
 
 def test_registry_with_no_memory_db_uses_static_priority():
-    from zeroedge.agent import BaseProvider, ProviderRegistry
+    from labi.agent import BaseProvider, ProviderRegistry
     registry = ProviderRegistry()
     registry.register(BaseProvider("b", "m", "", "k", ["coding"], priority=50))
     registry.register(BaseProvider("a", "m", "", "k", ["coding"], priority=10))
@@ -199,7 +199,7 @@ def test_registry_with_no_memory_db_uses_static_priority():
 # ---- session continuation detection (was misrouting follow-ups to coding) ----
 
 def test_followup_without_action_verb_routes_to_answering():
-    from zeroedge.agent import SessionContext, is_question_or_followup
+    from labi.agent import SessionContext, is_question_or_followup
     session = SessionContext()
     session.add("what is the best for coding?", "answer", "VS Code, PyCharm, etc.")
     # This is the exact phrase that got misrouted in practice.
@@ -207,19 +207,19 @@ def test_followup_without_action_verb_routes_to_answering():
 
 
 def test_standalone_action_request_routes_to_coding():
-    from zeroedge.agent import SessionContext, is_question_or_followup
+    from labi.agent import SessionContext, is_question_or_followup
     session = SessionContext()
     assert is_question_or_followup("write a script to check disk usage", session) is False
 
 
 def test_plain_question_still_detected():
-    from zeroedge.agent import SessionContext, is_question_or_followup
+    from labi.agent import SessionContext, is_question_or_followup
     session = SessionContext()
     assert is_question_or_followup("what is the capital of France?", session) is True
 
 
 def test_session_context_rolls_and_resets():
-    from zeroedge.agent import SessionContext
+    from labi.agent import SessionContext
     session = SessionContext(max_turns=2)
     session.add("goal1", "answer", "summary1")
     session.add("goal2", "answer", "summary2")
@@ -234,7 +234,7 @@ def test_session_context_rolls_and_resets():
 # ---- per-capability priority override ----
 
 def test_provider_ranks_differently_per_capability():
-    from zeroedge.agent import BaseProvider, ProviderRegistry
+    from labi.agent import BaseProvider, ProviderRegistry
     registry = ProviderRegistry()
     # groq: fast generalist, best for planning, deliberately worse for coding
     groq = BaseProvider("groq", "m", "", "k", ["planning", "coding"], priority=10,
@@ -250,7 +250,7 @@ def test_provider_ranks_differently_per_capability():
 
 
 def test_priority_for_falls_back_to_default_priority():
-    from zeroedge.agent import BaseProvider
+    from labi.agent import BaseProvider
     p = BaseProvider("x", "m", "", "k", ["a", "b"], priority=42, capability_priority={"a": 1})
     assert p.priority_for("a") == 1
     assert p.priority_for("b") == 42  # no override for "b" -- falls back to default
@@ -259,7 +259,7 @@ def test_priority_for_falls_back_to_default_priority():
 # ---- cost tracking ----
 
 def test_cost_tracker_accumulates():
-    from zeroedge.agent import CostTracker
+    from labi.agent import CostTracker
     ct = CostTracker()
     ct.add(0.0012)
     ct.add(0.0008)
@@ -269,7 +269,7 @@ def test_cost_tracker_accumulates():
 
 
 def test_memory_db_records_and_sums_cost(tmp_path):
-    from zeroedge.agent import MemoryDB
+    from labi.agent import MemoryDB
     db = MemoryDB(str(tmp_path / "mem.db"))
     db.record_provider_call("groq", "coding", True, 500, cost_usd=0.001)
     db.record_provider_call("groq", "coding", True, 500, cost_usd=0.002)
@@ -280,7 +280,7 @@ def test_memory_db_records_and_sums_cost(tmp_path):
 
 
 def test_save_task_persists_cost(tmp_path):
-    from zeroedge.agent import MemoryDB as AgentMemoryDB
+    from labi.agent import MemoryDB as AgentMemoryDB
     db = AgentMemoryDB(str(tmp_path / "mem.db"))
     db.save_task(task_id="t1", goal="do a thing", plan="plan", code="code",
                  answer="ok", provider="groq", success=True, cost_usd=0.0042)
@@ -292,7 +292,7 @@ def test_save_task_persists_cost(tmp_path):
 # blocking the whole test suite from collecting) ----
 
 def test_provider_registry_select_best_provider():
-    from zeroedge.providers.registry import ProviderRegistry
+    from labi.providers.registry import ProviderRegistry
     reg = ProviderRegistry()
     reg.register("groq", "coding", routing_score=0.6)
     reg.register("deepseek", "coding", routing_score=0.9)
@@ -302,7 +302,7 @@ def test_provider_registry_select_best_provider():
 
 
 def test_provider_registry_unavailable_excluded():
-    from zeroedge.providers.registry import ProviderRegistry
+    from labi.providers.registry import ProviderRegistry
     reg = ProviderRegistry()
     reg.register("flaky", "coding", available=False, routing_score=0.99)
     reg.register("steady", "coding", available=True, routing_score=0.5)
@@ -310,7 +310,7 @@ def test_provider_registry_unavailable_excluded():
 
 
 def test_provider_registry_unknown_key_degrades_gracefully():
-    from zeroedge.providers.registry import ProviderRegistry
+    from labi.providers.registry import ProviderRegistry
     reg = ProviderRegistry()
     status = reg.get_provider_status("nonexistent:role")
     assert status.available is True
@@ -318,7 +318,7 @@ def test_provider_registry_unknown_key_degrades_gracefully():
 
 
 def test_provider_registry_update_score_moves_toward_outcome():
-    from zeroedge.providers.registry import ProviderRegistry
+    from labi.providers.registry import ProviderRegistry
     reg = ProviderRegistry()
     key = reg.register("groq", "coding", routing_score=0.5)
     reg.update_score(key, success=True, decay=0.5)
@@ -330,15 +330,15 @@ def test_provider_registry_update_score_moves_toward_outcome():
 # ---- TaskClassifier risk gate (wired into agent.py's run action) ----
 
 def test_classifier_flags_high_risk_goal():
-    from zeroedge.intelligence.classifier import TaskClassifier
-    from zeroedge.intelligence.types import RiskLevel
+    from labi.intelligence.classifier import TaskClassifier
+    from labi.intelligence.types import RiskLevel
     profile = TaskClassifier().classify("delete all rows from the database")
     assert profile.risk == RiskLevel.HIGH
 
 
 def test_classifier_low_risk_for_benign_goal():
-    from zeroedge.intelligence.classifier import TaskClassifier
-    from zeroedge.intelligence.types import RiskLevel
+    from labi.intelligence.classifier import TaskClassifier
+    from labi.intelligence.types import RiskLevel
     profile = TaskClassifier().classify("reverse a string")
     assert profile.risk == RiskLevel.LOW
 
@@ -346,28 +346,74 @@ def test_classifier_low_risk_for_benign_goal():
 # ---- Cerebras live model discovery (was a hardcoded name that went stale) ----
 
 def test_pick_cerebras_model_prefers_llama():
-    from zeroedge.agent import pick_cerebras_model
+    from labi.agent import pick_cerebras_model
     fake_response = {"data": [{"id": "gpt-oss-120b"}, {"id": "llama-3.3-70b"}, {"id": "zai-glm-4.7"}]}
     result = pick_cerebras_model("fake-key", fetch_fn=lambda key: fake_response)
     assert result == "llama-3.3-70b"
 
 
 def test_pick_cerebras_model_falls_back_to_first_when_no_llama():
-    from zeroedge.agent import pick_cerebras_model
+    from labi.agent import pick_cerebras_model
     fake_response = {"data": [{"id": "gpt-oss-120b"}, {"id": "zai-glm-4.7"}]}
     result = pick_cerebras_model("fake-key", fetch_fn=lambda key: fake_response)
     assert result == "gpt-oss-120b"
 
 
 def test_pick_cerebras_model_returns_none_on_empty_catalog():
-    from zeroedge.agent import pick_cerebras_model
+    from labi.agent import pick_cerebras_model
     result = pick_cerebras_model("fake-key", fetch_fn=lambda key: {"data": []})
     assert result is None
 
 
 def test_pick_cerebras_model_returns_none_on_fetch_failure():
-    from zeroedge.agent import pick_cerebras_model
+    from labi.agent import pick_cerebras_model
     def broken_fetch(key):
         raise ConnectionError("simulated network failure")
     result = pick_cerebras_model("fake-key", fetch_fn=broken_fetch)
     assert result is None
+
+
+# ---- daily usage / quota tracking ----
+
+def test_record_and_get_daily_usage(tmp_path):
+    from labi.agent import MemoryDB
+    db = MemoryDB(str(tmp_path / "mem.db"))
+    db.record_daily_usage("groq", tokens=1500, requests=1, day="2026-07-24")
+    db.record_daily_usage("groq", tokens=2000, requests=1, day="2026-07-24")
+    db.record_daily_usage("groq", tokens=500, requests=1, day="2026-07-23")  # different day, separate bucket
+    usage = db.get_daily_usage("groq", day="2026-07-24")
+    assert usage["requests"] == 2
+    assert usage["tokens"] == 3500
+
+
+def test_get_all_daily_usage_scoped_to_one_day(tmp_path):
+    from labi.agent import MemoryDB
+    db = MemoryDB(str(tmp_path / "mem.db"))
+    db.record_daily_usage("groq", tokens=100, requests=1, day="2026-07-24")
+    db.record_daily_usage("gemini", tokens=200, requests=1, day="2026-07-24")
+    db.record_daily_usage("groq", tokens=999, requests=1, day="2026-07-01")
+    all_today = db.get_all_daily_usage(day="2026-07-24")
+    assert set(all_today.keys()) == {"groq", "gemini"}
+    assert all_today["groq"]["tokens"] == 100
+
+
+def test_compute_quota_status_known_provider():
+    from labi.agent import compute_quota_status
+    status = compute_quota_status("groq", {"requests": 300, "tokens": 50000})
+    assert status["limit"] == 1000
+    assert status["used"] == 300
+    assert status["remaining"] == 700
+    assert status["pct_used"] == 30.0
+
+
+def test_compute_quota_status_unknown_provider_returns_none():
+    from labi.agent import compute_quota_status
+    status = compute_quota_status("some_new_provider_not_in_table", {"requests": 5, "tokens": 100})
+    assert status is None
+
+
+def test_compute_quota_status_over_limit_clamps_at_zero_remaining():
+    from labi.agent import compute_quota_status
+    status = compute_quota_status("groq", {"requests": 1200, "tokens": 999999})
+    assert status["remaining"] == 0
+    assert status["pct_used"] == 120.0

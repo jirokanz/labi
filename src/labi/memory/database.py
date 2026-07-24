@@ -6,14 +6,14 @@ from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
 
-from zeroedge.memory.models import MemoryRecord, MemoryCandidate
-from zeroedge.memory.migration_manager import MigrationManager
-from zeroedge.core.version import ZER_VERSION, get_major_version
+from labi.memory.models import MemoryRecord, MemoryCandidate
+from labi.memory.migration_manager import MigrationManager
+from labi.core.version import LABI_VERSION, get_major_version
 
 class MemoryDB:
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
-        self._current_major = get_major_version(ZER_VERSION)
+        self._current_major = get_major_version(LABI_VERSION)
         migrations_dir = Path(__file__).parent / "migrations"
         MigrationManager(db_path, migrations_dir).initialize()
 

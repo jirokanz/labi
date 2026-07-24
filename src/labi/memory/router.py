@@ -1,8 +1,8 @@
 
-from zeroedge.memory.database import MemoryDatabase
-from zeroedge.memory.confidence import ConfidenceEvaluator
-from zeroedge.memory.policy import MemoryDecisionPolicy
-from zeroedge.memory.guard import ReplayGuard
+from labi.memory.database import MemoryDatabase
+from labi.memory.confidence import ConfidenceEvaluator
+from labi.memory.policy import MemoryDecisionPolicy
+from labi.memory.guard import ReplayGuard
 
 class MemoryRouter:
     def __init__(self, db, evaluator=None, policy=None, guard=None):
