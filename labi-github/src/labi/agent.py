@@ -132,6 +132,14 @@ def format_code_block(code, title="code"):
 
 
 # ---------- Code extraction ----------
+def estimate_tokens(text):
+    """Rough chars/4 estimate -- deliberately not calling litellm.token_counter
+    here (that's a heavier, model-specific call). This only needs to be
+    right enough to skip a provider whose context window is clearly too
+    small, not exact."""
+    return len(text) // 4
+
+
 def extract_code(text):
     match = re.search(r"```(?:python)?\n(.*?)\n```", text, re.DOTALL)
     if match:
@@ -431,7 +439,44 @@ def ask_action(prompt="What next?", options=("r", "e", "f", "s")):
         print(f"Please choose one of: {', '.join(options)}")
 
 
-def run_with_autofix_interactive(goal, plan, coder, workspace, stats_store, task_id, cost_tracker):
+def validate_result(goal, code, stdout, registry, stats_store, cost_tracker):
+    """The Validator stage: exit_code == 0 only proves the code didn't
+    crash, not that it did what was asked. This runs a second, independent
+    LLM pass (the 'validation' capability -- Gemini primary, OpenRouter
+    fallback) that actually checks the output against the goal.
+
+    Returns (passed: bool, reason: str, ran: bool) -- ran=False means no
+    validation provider was available, so the caller should treat this as
+    'unverified' rather than 'failed'."""
+    validator = registry.get_best("validation", stats_store=stats_store)
+    if not validator:
+        return True, "No validation provider available -- unverified.", False
+
+    check_prompt = (
+        f"Goal: {goal}\n\n"
+        f"Code that was run:\n{code}\n\n"
+        f"Output produced:\n{stdout[:1500]}\n\n"
+        "Does this output actually accomplish the stated goal? This is a real "
+        "check, not a rubber stamp -- look for wrong values, missing parts of "
+        "the request, or output that runs without error but doesn't answer "
+        "what was asked.\n"
+        "Respond with exactly one line: 'PASS' or 'FAIL: <one-sentence reason>'."
+    )
+    try:
+        raw = stream_generate(
+            validator, check_prompt, max_tokens=100, label="Validating", render="text",
+            stats_store=stats_store, capability="validation", cost_tracker=cost_tracker,
+        )
+    except Exception as e:
+        return True, f"Validator call failed ({e}) -- unverified.", False
+
+    verdict = raw.strip()
+    if verdict.upper().startswith("PASS"):
+        return True, "Validator confirmed the output matches the goal.", True
+    return False, verdict, True
+
+
+def run_with_autofix_interactive(goal, plan, coder, workspace, registry, stats_store, task_id, cost_tracker):
     """Interactive plan->code->review loop. Unlike the old one-shot
     generate-and-run, this shows you the code before executing and lets
     you approve, hand-edit, or give free-text feedback to regenerate --
@@ -506,7 +551,35 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, stats_store, task
                 print(_c("Execution succeeded.", "green"))
                 if stdout:
                     print(f"Output:\n{stdout}")
-                return code, stdout, stderr, provider
+
+                passed, reason, validator_ran = validate_result(goal, code, stdout, registry, stats_store, cost_tracker)
+                if validator_ran:
+                    if passed:
+                        print(_c(f"Validator: PASS -- {reason}", "green"))
+                    else:
+                        print(_c(f"Validator: FAIL -- {reason}", "red"))
+                else:
+                    print(_c(f"Validator: {reason}", "grey"))
+
+                if passed or attempt == MAX_FIX_ATTEMPTS - 1:
+                    return code, stdout, stderr, provider
+
+                # Validator caught something exit_code==0 couldn't --
+                # treat it like an execution failure and try again,
+                # same as the exit_code != 0 branch below.
+                fix_prompt = (f"The Python code for goal '{goal}' ran without crashing, but a "
+                              f"reviewer found this problem: {reason}\n\nCurrent code:\n{code}\n\n"
+                              "Output only the corrected code.")
+                raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history,
+                                       label=f"Auto-fixing after failed validation (attempt {attempt + 1})",
+                                       render="code", stats_store=stats_store, capability="coding",
+                                       cost_tracker=cost_tracker)
+                new_code = extract_code(raw)
+                show_diff(code, new_code)
+                history.append({"role": "user", "content": fix_prompt})
+                history.append({"role": "assistant", "content": raw})
+                code = new_code
+                continue
 
             print(_c(f"Execution failed (exit code {exit_code}).", "red"))
             if stderr:
@@ -545,7 +618,8 @@ def print_provider_rankings(registry, stats_store):
                 detail = f"only {stats['calls']} calls so far -- using static priority ({p.priority_for(cap)})"
             else:
                 detail = f"no data yet -- using static priority ({p.priority_for(cap)})"
-            print(f"    {rank}. {p.name:12s} {_c(detail, 'grey')}")
+            ctx = f", {p.context_window // 1000}K context" if p.context_window else ""
+            print(f"    {rank}. {p.name:12s} {_c(detail + ctx, 'grey')}")
 
 
 def print_cost_summary(stats_store):
@@ -600,7 +674,7 @@ def build_registry():
         return False
 
     def register_discovered(name, model_prefix, api_base, key_env, capabilities, priority, picker,
-                             capability_priority=None):
+                             capability_priority=None, context_window=None):
         """Same as register_provider, but the model id is looked up live
         via `picker` (see pick_*_model in providers/adaptive_registry.py)
         instead of being hardcoded -- so a provider retiring/renaming a
@@ -616,15 +690,19 @@ def build_registry():
                       f"({reason}) -- skipping {name} this session.", "yellow"))
             return False
         registry.register(BaseProvider(name, f"{model_prefix}/{model_id}", api_base, key,
-                                        capabilities, priority, capability_priority))
+                                        capabilities, priority, capability_priority, context_window))
         return True
 
     # Groq: fast general-purpose model, primary for both planning and
     # coding for now. llama-3.3-70b-versatile (the old hardcoded model)
     # is deprecated by Groq, shutdown 08/16/2026 -- discovered live now
     # (see pick_groq_model) instead of hardcoding its replacement.
+    # context_window: every model in PREFERRED_GROQ_MODELS (gpt-oss-120b,
+    # qwen3.6-27b, llama-3.3) is independently verified at 128K+ on Groq,
+    # so 128000 is a safe floor regardless of which one discovery lands on.
     register_discovered("groq", "groq", "https://api.groq.com/openai/v1",
-                         "GROQ_API_KEY", ["planning", "coding"], 10, pick_groq_model)
+                         "GROQ_API_KEY", ["planning", "coding"], 10, pick_groq_model,
+                         context_window=128000)
     # DeepSeek removed for now -- not actually free (per-token paid API),
     # so it shouldn't be a default in a "free/cheap providers" pool.
     # Re-add with capability_priority={"coding": 5} on groq's coding entry
@@ -646,14 +724,19 @@ def build_registry():
     # (30) would rank AHEAD of Gemini for validation, which is backwards;
     # coding needs no override since OpenRouter's 30 is already behind
     # Groq's 10.
+    # context_window intentionally left unset (None) -- which specific
+    # free model OpenRouter serves varies too much to guess a safe number.
     register_discovered("openrouter", "openrouter", "https://openrouter.ai/api/v1",
                          "OPENROUTER_API_KEY", ["answering", "planning", "coding", "validation"], 30,
                          pick_openrouter_model, capability_priority={"validation": 45})
     # Gemini: gemini-2.5-flash (the old hardcoded model) is deprecated,
     # shutdown 10/16/2026, and some accounts report it already failing
     # ahead of that date -- discovered live now (see pick_gemini_model).
+    # context_window: every model in PREFERRED_GEMINI_MODELS (the 3.x
+    # Flash family) is documented at ~1M tokens.
     register_discovered("gemini", "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/",
-                         "GEMINI_API_KEY", ["answering", "validation"], 40, pick_gemini_model)
+                         "GEMINI_API_KEY", ["answering", "validation"], 40, pick_gemini_model,
+                         context_window=1000000)
     # NVIDIA NIM removed for now -- its free access is a "hosted evaluation
     # endpoint" rather than a confirmed indefinite production free tier.
     # Re-add if you verify your own account's limits are workable:
@@ -802,12 +885,13 @@ def main():
         is_question = is_question_or_followup(goal, session)
 
         if is_question:
-            candidates = registry.get_all("answering", stats_store=stats_store)
-            if not candidates:
-                print("No provider configured for answering.")
-                continue
             context = session.as_context()
             prompt = f"{context}New message: {goal}" if context else goal
+            candidates = registry.get_all("answering", stats_store=stats_store,
+                                           min_context=estimate_tokens(prompt) + 200)
+            if not candidates:
+                print("No provider configured for answering (or none with enough context for this conversation -- try 'reset').")
+                continue
             cost_tracker = CostTracker()
             for provider in candidates:
                 try:
@@ -833,22 +917,23 @@ def main():
             continue
 
         ws_path = workspace.create_workspace(task_id)
-        planner = registry.get_best("planning", stats_store=stats_store)
+        context = session.as_context()
+        plan_prompt = f"{context}Create a short, clear, numbered plan for: {goal}"
+        planner = registry.get_best("planning", stats_store=stats_store,
+                                     min_context=estimate_tokens(plan_prompt) + 200)
         coder = registry.get_best("coding", stats_store=stats_store)
         if not planner or not coder:
-            print("No provider configured for planning/coding.")
+            print("No provider configured for planning/coding (or none with enough context -- try 'reset').")
             continue
 
         cost_tracker = CostTracker()
-        context = session.as_context()
-        plan_prompt = f"{context}Create a short, clear, numbered plan for: {goal}"
         plan = stream_generate(planner, plan_prompt,
                                 max_tokens=1024, label="Planning", stats_store=stats_store, capability="planning",
                                 cost_tracker=cost_tracker)
         workspace.save_plan(ws_path, plan)
 
         code, stdout, stderr, provider = run_with_autofix_interactive(
-            goal, plan, coder, workspace, stats_store, task_id, cost_tracker)
+            goal, plan, coder, workspace, registry, stats_store, task_id, cost_tracker)
 
         if cost_tracker.total > 0:
             print(_c(f"Task cost so far: ${cost_tracker.total:.6f} across {cost_tracker.calls} calls", "grey"))

@@ -480,3 +480,97 @@ def test_compute_quota_status_over_limit_clamps_at_zero_remaining():
     status = compute_quota_status("groq", {"requests": 1200, "tokens": 999999})
     assert status["remaining"] == 0
     assert status["pct_used"] == 120.0
+
+
+# ---- Validator step (Phase C.5) ----
+
+class _FakeValidatorProvider:
+    """Minimal stand-in for BaseProvider -- just enough surface for
+    stream_generate to call generate_stream/generate without hitting a
+    real API."""
+    def __init__(self, name, verdict):
+        self.name = name
+        self._verdict = verdict
+
+    def generate_stream(self, prompt, system_prompt=None, max_tokens=768, history=None):
+        yield self._verdict
+
+    def generate(self, prompt, system_prompt=None, max_tokens=768, history=None):
+        return {"content": self._verdict}
+
+
+class _FakeRegistry:
+    def __init__(self, provider):
+        self._provider = provider
+
+    def get_best(self, capability, stats_store=None, min_context=None):
+        return self._provider
+
+
+def test_validate_result_pass():
+    from labi.agent import validate_result, CostTracker
+    registry = _FakeRegistry(_FakeValidatorProvider("gemini", "PASS"))
+    passed, reason, ran = validate_result("reverse a string", "code", "output", registry, None, CostTracker())
+    assert passed is True
+    assert ran is True
+
+
+def test_validate_result_fail():
+    from labi.agent import validate_result, CostTracker
+    registry = _FakeRegistry(_FakeValidatorProvider("gemini", "FAIL: output is empty"))
+    passed, reason, ran = validate_result("reverse a string", "code", "output", registry, None, CostTracker())
+    assert passed is False
+    assert "empty" in reason
+    assert ran is True
+
+
+def test_validate_result_no_validator_available_is_unverified_not_failed():
+    from labi.agent import validate_result, CostTracker
+    registry = _FakeRegistry(None)  # no provider registered for "validation"
+    passed, reason, ran = validate_result("reverse a string", "code", "output", registry, None, CostTracker())
+    assert passed is True  # unverified should not block completion
+    assert ran is False
+
+
+# ---- Richer model metadata: context_window + min_context filtering ----
+
+def test_base_provider_context_window_defaults_to_none():
+    from labi.agent import BaseProvider
+    p = BaseProvider("x", "m", "", "k", ["coding"])
+    assert p.context_window is None
+
+
+def test_registry_excludes_provider_with_known_too_small_context():
+    from labi.agent import BaseProvider, ProviderRegistry
+    registry = ProviderRegistry()
+    small = BaseProvider("small", "m", "", "k", ["coding"], priority=10, context_window=1000)
+    big = BaseProvider("big", "m", "", "k", ["coding"], priority=50, context_window=200000)
+    registry.register(small)
+    registry.register(big)
+    best = registry.get_best("coding", min_context=50000)
+    assert best.name == "big"  # small excluded despite better priority
+
+
+def test_registry_does_not_exclude_unknown_context_window():
+    from labi.agent import BaseProvider, ProviderRegistry
+    registry = ProviderRegistry()
+    unknown = BaseProvider("unknown", "m", "", "k", ["coding"], priority=10, context_window=None)
+    registry.register(unknown)
+    # No basis to exclude an unverified window -- shouldn't be filtered out.
+    best = registry.get_best("coding", min_context=999999)
+    assert best.name == "unknown"
+
+
+def test_registry_min_context_none_includes_everyone():
+    from labi.agent import BaseProvider, ProviderRegistry
+    registry = ProviderRegistry()
+    small = BaseProvider("small", "m", "", "k", ["coding"], priority=10, context_window=100)
+    registry.register(small)
+    best = registry.get_best("coding", min_context=None)
+    assert best.name == "small"
+
+
+def test_estimate_tokens_rough_heuristic():
+    from labi.agent import estimate_tokens
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("a" * 400) == 100

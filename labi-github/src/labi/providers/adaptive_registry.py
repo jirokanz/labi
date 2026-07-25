@@ -23,7 +23,7 @@ import litellm
 
 class BaseProvider:
     def __init__(self, name, model, api_base, api_key, capabilities=None, priority=100,
-                 capability_priority=None):
+                 capability_priority=None, context_window=None):
         self.name = name
         self.model = model
         self.api_base = api_base
@@ -34,6 +34,13 @@ class BaseProvider:
         # provider higher for coding specifically without changing its
         # (possibly lower) rank for other capabilities it also serves.
         self.capability_priority = capability_priority or {}
+        # Known context window in tokens, or None if genuinely unverified.
+        # Left None rather than guessed for providers where the actually
+        # served model varies (OpenRouter/Cerebras free catalogs both
+        # change under us -- see pick_*_model) since a wrong guess here
+        # would silently exclude a provider that could actually handle
+        # the request, or worse, include one that can't.
+        self.context_window = context_window
 
     def priority_for(self, capability):
         return self.capability_priority.get(capability, self.priority)
@@ -112,15 +119,22 @@ class AdaptiveProviderRegistry:
         # success rate dominates (0-100 range), latency is a tie-breaking penalty
         return (success_rate * 100) - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC)
 
-    def get_best(self, capability, stats_store=None):
-        candidates = [p for p in self.providers if capability in p.capabilities]
+    def _fits(self, provider, min_context):
+        if min_context is None or provider.context_window is None:
+            return True  # unknown window -- don't exclude, we have no basis to
+        return provider.context_window >= min_context
+
+    def get_best(self, capability, stats_store=None, min_context=None):
+        candidates = [p for p in self.providers
+                      if capability in p.capabilities and self._fits(p, min_context)]
         if not candidates:
             return None
         candidates.sort(key=lambda p: self._score(p, capability, stats_store), reverse=True)
         return candidates[0]
 
-    def get_all(self, capability, stats_store=None):
-        candidates = [p for p in self.providers if capability in p.capabilities]
+    def get_all(self, capability, stats_store=None, min_context=None):
+        candidates = [p for p in self.providers
+                      if capability in p.capabilities and self._fits(p, min_context)]
         candidates.sort(key=lambda p: self._score(p, capability, stats_store), reverse=True)
         return candidates
 
