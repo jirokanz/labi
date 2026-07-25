@@ -38,11 +38,24 @@ from labi.tools.python.security import validate_code as static_validate_code
 from labi.tools.python.limits import make_preexec_fn, enforce_output_limit
 from labi.intelligence.classifier import TaskClassifier
 from labi.intelligence.types import RiskLevel
+from labi.providers.adaptive_registry import (
+    BaseProvider,
+    AdaptiveProviderRegistry as ProviderRegistry,
+    pick_cerebras_model,
+    pick_groq_model,
+    pick_gemini_model,
+    pick_openrouter_model,
+    KNOWN_QUOTAS,
+    compute_quota_status,
+)
+from labi.providers.stats import ProviderStatsStore
+from labi.providers.cost import CostTracker
 
 load_dotenv()
 
 # ---------- Configuration ----------
 DB_PATH = os.getenv("LABI_DB_PATH", "memory.db")
+STATS_DB_PATH = os.getenv("LABI_STATS_DB_PATH", "provider_stats.db")
 WORKSPACE_ROOT = Path.home() / "labi" / "workspace"
 MAX_FIX_ATTEMPTS = 3
 EXECUTION_TIMEOUT = 20
@@ -118,110 +131,6 @@ def extract_code(text):
     return text.strip()
 
 
-# ---------- Provider ----------
-class BaseProvider:
-    def __init__(self, name, model, api_base, api_key, capabilities=None, priority=100,
-                 capability_priority=None):
-        self.name = name
-        self.model = model
-        self.api_base = api_base
-        self.api_key = api_key
-        self.capabilities = capabilities or ["text_generation"]
-        self.priority = priority
-        # Optional per-capability override, e.g. {"coding": 5} to rank this
-        # provider higher for coding specifically without changing its
-        # (possibly lower) rank for other capabilities it also serves.
-        self.capability_priority = capability_priority or {}
-
-    def priority_for(self, capability):
-        return self.capability_priority.get(capability, self.priority)
-
-    def _messages(self, prompt, system_prompt, history):
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
-        return messages
-
-    def generate(self, prompt, system_prompt=None, max_tokens=768, history=None):
-        messages = self._messages(prompt, system_prompt, history)
-        try:
-            response = litellm.completion(
-                model=self.model, messages=messages, api_base=self.api_base,
-                api_key=self.api_key, max_tokens=max_tokens, temperature=0.3,
-            )
-        except Exception as e:
-            raise Exception(f"Provider {self.name} failed: {e}")
-        usage = response.get("usage", {})
-        return {
-            "content": response.choices[0].message.content,
-            "model": response.model,
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-            "provider": self.name,
-        }
-
-    def generate_stream(self, prompt, system_prompt=None, max_tokens=768, history=None):
-        """Yields text chunks as they arrive, for a live 'vibe coding' feel.
-        Falls back to a single chunk if the provider/model can't stream."""
-        messages = self._messages(prompt, system_prompt, history)
-        try:
-            stream = litellm.completion(
-                model=self.model, messages=messages, api_base=self.api_base,
-                api_key=self.api_key, max_tokens=max_tokens, temperature=0.3,
-                stream=True,
-            )
-            full = []
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta:
-                    full.append(delta)
-                    yield delta
-            self._last_full = "".join(full)
-        except Exception as e:
-            raise Exception(f"Provider {self.name} failed: {e}")
-
-
-class ProviderRegistry:
-    MIN_SAMPLES = 4          # below this, trust the static priority (cold start)
-    LATENCY_PENALTY_PER_SEC = 5  # score points lost per second of avg latency
-
-    def __init__(self):
-        self.providers = []
-
-    def register(self, provider):
-        self.providers.append(provider)
-
-    def _score(self, provider, capability, memory_db):
-        """Higher is better. Blends measured success rate + latency with the
-        static priority as a prior, so a provider with few/no data points
-        still ranks the same as the old hardcoded-priority behavior."""
-        static_score = 1000 - provider.priority_for(capability)  # invert: lower priority number = higher score
-        if memory_db is None:
-            return static_score
-        stats = memory_db.get_provider_stats(provider.name, capability)
-        if not stats or stats["calls"] < self.MIN_SAMPLES:
-            return static_score
-        success_rate = stats["successes"] / stats["calls"]
-        avg_latency_s = stats["total_latency_ms"] / stats["calls"] / 1000
-        # success rate dominates (0-100 range), latency is a tie-breaking penalty
-        return (success_rate * 100) - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC)
-
-    def get_best(self, capability, memory_db=None):
-        candidates = [p for p in self.providers if capability in p.capabilities]
-        if not candidates:
-            return None
-        candidates.sort(key=lambda p: self._score(p, capability, memory_db), reverse=True)
-        return candidates[0]
-
-    def get_all(self, capability, memory_db=None):
-        candidates = [p for p in self.providers if capability in p.capabilities]
-        candidates.sort(key=lambda p: self._score(p, capability, memory_db), reverse=True)
-        return candidates
-
 
 # ---------- Memory ----------
 class MemoryDB:
@@ -242,26 +151,6 @@ class MemoryDB:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS provider_stats (
-                provider TEXT,
-                capability TEXT,
-                calls INTEGER DEFAULT 0,
-                successes INTEGER DEFAULT 0,
-                total_latency_ms REAL DEFAULT 0,
-                total_cost_usd REAL DEFAULT 0,
-                PRIMARY KEY (provider, capability)
-            )
-        """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS daily_usage (
-                provider TEXT,
-                day TEXT,
-                requests INTEGER DEFAULT 0,
-                tokens INTEGER DEFAULT 0,
-                PRIMARY KEY (provider, day)
-            )
-        """)
         self.conn.commit()
         self._migrate()
 
@@ -277,72 +166,6 @@ class MemoryDB:
             if col not in existing:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
                 self.conn.commit()
-
-        cur = self.conn.execute("PRAGMA table_info(provider_stats)")
-        existing_ps = [row[1] for row in cur.fetchall()]
-        if "total_cost_usd" not in existing_ps:
-            self.conn.execute("ALTER TABLE provider_stats ADD COLUMN total_cost_usd REAL DEFAULT 0")
-            self.conn.commit()
-
-    def record_provider_call(self, provider, capability, success, latency_ms, cost_usd=0.0):
-        self.conn.execute(
-            "INSERT INTO provider_stats (provider, capability, calls, successes, total_latency_ms, total_cost_usd) "
-            "VALUES (?, ?, 1, ?, ?, ?) "
-            "ON CONFLICT(provider, capability) DO UPDATE SET "
-            "calls = calls + 1, "
-            "successes = successes + ?, "
-            "total_latency_ms = total_latency_ms + ?, "
-            "total_cost_usd = total_cost_usd + ?",
-            (provider, capability, int(success), latency_ms, cost_usd,
-             int(success), latency_ms, cost_usd),
-        )
-        self.conn.commit()
-
-    def get_provider_stats(self, provider, capability):
-        cur = self.conn.execute(
-            "SELECT calls, successes, total_latency_ms, total_cost_usd FROM provider_stats WHERE provider=? AND capability=?",
-            (provider, capability),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {"calls": row[0], "successes": row[1], "total_latency_ms": row[2], "total_cost_usd": row[3] or 0.0}
-
-    def get_total_cost(self):
-        cur = self.conn.execute("SELECT COALESCE(SUM(total_cost_usd), 0) FROM provider_stats")
-        return cur.fetchone()[0]
-
-    def get_all_provider_stats(self):
-        cur = self.conn.execute("SELECT provider, capability, calls, successes, total_latency_ms, total_cost_usd FROM provider_stats")
-        return [
-            {"provider": r[0], "capability": r[1], "calls": r[2], "successes": r[3],
-             "total_latency_ms": r[4], "total_cost_usd": r[5] or 0.0}
-            for r in cur.fetchall()
-        ]
-
-    def record_daily_usage(self, provider, tokens, requests=1, day=None):
-        day = day or datetime.utcnow().strftime("%Y-%m-%d")
-        self.conn.execute(
-            "INSERT INTO daily_usage (provider, day, requests, tokens) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(provider, day) DO UPDATE SET "
-            "requests = requests + ?, tokens = tokens + ?",
-            (provider, day, requests, tokens, requests, tokens),
-        )
-        self.conn.commit()
-
-    def get_daily_usage(self, provider, day=None):
-        day = day or datetime.utcnow().strftime("%Y-%m-%d")
-        cur = self.conn.execute(
-            "SELECT requests, tokens FROM daily_usage WHERE provider=? AND day=?",
-            (provider, day),
-        )
-        row = cur.fetchone()
-        return {"requests": row[0], "tokens": row[1]} if row else {"requests": 0, "tokens": 0}
-
-    def get_all_daily_usage(self, day=None):
-        day = day or datetime.utcnow().strftime("%Y-%m-%d")
-        cur = self.conn.execute("SELECT provider, requests, tokens FROM daily_usage WHERE day=?", (day,))
-        return {r[0]: {"requests": r[1], "tokens": r[2]} for r in cur.fetchall()}
 
     def find_similar(self, goal):
         words = set(goal.lower().split())
@@ -507,7 +330,7 @@ def show_diff(old_code, new_code):
 
 
 def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, history=None,
-                     label="Generating", render="text", memory_db=None, capability=None,
+                     label="Generating", render="text", stats_store=None, capability=None,
                      cost_tracker=None):
     """Streams from the provider as it's produced (vibe-coding feel).
     render='text'  -> print raw chunks live (good for prose: plans, answers)
@@ -516,9 +339,9 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
                        once generation is complete (avoids dumping raw,
                        unhighlighted, possibly-mid-fence text to the screen
                        and then immediately re-printing the same code).
-    If memory_db + capability are given, records success/latency/cost so
-    ProviderRegistry can rank providers by measured performance instead
-    of only the static hardcoded priority.
+    If stats_store (a ProviderStatsStore) + capability are given, records
+    success/latency/cost so AdaptiveProviderRegistry can rank providers by
+    measured performance instead of only the static hardcoded priority.
     If cost_tracker (a CostTracker) is given, the estimated cost of this
     call is added to its running total for the current task."""
     import time
@@ -575,10 +398,10 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
                 total_tokens = 0
         if cost_tracker is not None:
             cost_tracker.add(cost)
-        if memory_db is not None and capability is not None:
+        if stats_store is not None and capability is not None:
             try:
-                memory_db.record_provider_call(provider.name, capability, success, latency_ms, cost_usd=cost)
-                memory_db.record_daily_usage(provider.name, tokens=total_tokens, requests=1)
+                stats_store.record_provider_call(provider.name, capability, success, latency_ms, cost_usd=cost)
+                stats_store.record_daily_usage(provider.name, tokens=total_tokens, requests=1)
             except Exception:
                 pass  # stats tracking should never break the actual task
 
@@ -600,7 +423,7 @@ def ask_action(prompt="What next?", options=("r", "e", "f", "s")):
         print(f"Please choose one of: {', '.join(options)}")
 
 
-def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_id, cost_tracker):
+def run_with_autofix_interactive(goal, plan, coder, workspace, stats_store, task_id, cost_tracker):
     """Interactive plan->code->review loop. Unlike the old one-shot
     generate-and-run, this shows you the code before executing and lets
     you approve, hand-edit, or give free-text feedback to regenerate --
@@ -616,7 +439,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
         print(_c(f"   Risk assessment: {risk_profile.risk.value.upper()} (flagged on: {kw})", "yellow"))
 
     gen_prompt = f"Write Python code for this goal:\nGoal: {goal}\nPlan: {plan}\n\nOutput only the code, no explanation."
-    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code", memory_db=memory_db, capability="coding", cost_tracker=cost_tracker)
+    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code", stats_store=stats_store, capability="coding", cost_tracker=cost_tracker)
     code = extract_code(raw)
     provider = coder.name
     history.append({"role": "user", "content": gen_prompt})
@@ -644,7 +467,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
         if action == "f":
             feedback = input("What should change? ").strip()
             fix_prompt = f"The current code for goal '{goal}' needs this change:\n{feedback}\n\nCurrent code:\n{code}\n\nOutput only the corrected full code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code", memory_db=memory_db, capability="coding", cost_tracker=cost_tracker)
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code", stats_store=stats_store, capability="coding", cost_tracker=cost_tracker)
             new_code = extract_code(raw)
             print("Diff vs. previous version:")
             show_diff(code, new_code)
@@ -684,7 +507,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
                 break
 
             fix_prompt = f"The Python code for goal '{goal}' failed:\n\n{stderr}\n\nCurrent code:\n{code}\n\nOutput only the corrected code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code", memory_db=memory_db, capability="coding", cost_tracker=cost_tracker)
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code", stats_store=stats_store, capability="coding", cost_tracker=cost_tracker)
             new_code = extract_code(raw)
             show_diff(code, new_code)
             history.append({"role": "user", "content": fix_prompt})
@@ -696,16 +519,16 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
 
 
 # ---------- Provider registry ----------
-def print_provider_rankings(registry, memory_db):
+def print_provider_rankings(registry, stats_store):
     print(f"\n{_c('Provider rankings (measured performance, falls back to static priority until ' + str(ProviderRegistry.MIN_SAMPLES) + '+ calls):', 'bold')}")
     capabilities = sorted({cap for p in registry.providers for cap in p.capabilities})
     for cap in capabilities:
-        candidates = registry.get_all(cap, memory_db=memory_db)
+        candidates = registry.get_all(cap, stats_store=stats_store)
         if not candidates:
             continue
         print(f"\n  {_c(cap, 'cyan')}:")
         for rank, p in enumerate(candidates, 1):
-            stats = memory_db.get_provider_stats(p.name, cap)
+            stats = stats_store.get_provider_stats(p.name, cap)
             if stats and stats["calls"] >= ProviderRegistry.MIN_SAMPLES:
                 rate = stats["successes"] / stats["calls"] * 100
                 avg_ms = stats["total_latency_ms"] / stats["calls"]
@@ -717,10 +540,10 @@ def print_provider_rankings(registry, memory_db):
             print(f"    {rank}. {p.name:12s} {_c(detail, 'grey')}")
 
 
-def print_cost_summary(memory_db):
-    total = memory_db.get_total_cost()
+def print_cost_summary(stats_store):
+    total = stats_store.get_total_cost()
     print(f"\n{_c('Lifetime estimated cost: $' + f'{total:.6f}', 'bold')}")
-    stats = memory_db.get_all_provider_stats()
+    stats = stats_store.get_all_provider_stats()
     if not stats:
         print("  (no calls recorded yet)")
         return
@@ -734,71 +557,9 @@ def print_cost_summary(memory_db):
              "pricing data for that model -- not a guarantee of zero cost.", "grey"))
 
 
-def _fetch_cerebras_models(api_key, timeout=5):
-    import urllib.request
-    import json as _json
-    req = urllib.request.Request(
-        "https://api.cerebras.ai/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return _json.loads(resp.read())
-
-
-def pick_cerebras_model(api_key, fetch_fn=_fetch_cerebras_models):
-    """Cerebras's free-tier model catalog is confirmed to change without
-    notice (one documented case: ~12 models down to 2 within months, same
-    NotFoundError we hit live) -- hardcoding a model name is fragile by
-    design. Query the live /v1/models endpoint and pick a workable one
-    instead of guessing. Returns None (caller should skip registering
-    Cerebras this session) if discovery fails or the catalog is empty."""
-    try:
-        data = fetch_fn(api_key)
-        model_ids = [m["id"] for m in data.get("data", [])]
-    except Exception:
-        return None
-    if not model_ids:
-        return None
-    for mid in model_ids:
-        if "llama" in mid.lower():
-            return mid
-    return model_ids[0]
-
-
-# Best-effort published free-tier limits, as verified at the time these
-# providers were added to this file. These are NOT queried live -- we've
-# already been burned repeatedly by providers changing things without
-# notice (model catalogs, retirements), so treat these numbers as "last
-# known good", not gospel. Re-verify against the provider's own docs if
-# a number here looks suspiciously stale or a quota-based prediction
-# doesn't match what you're actually seeing.
-KNOWN_QUOTAS = {
-    "groq": {"requests_per_day": 1000, "requests_per_minute": 30},
-    "gemini": {"requests_per_day": 1500, "requests_per_minute": 15},
-    "mistral": {"requests_per_day": None, "requests_per_minute": 1},  # "prototyping only" tier, RPM-limited
-    "cerebras": {"requests_per_day": None, "requests_per_minute": None},  # catalog + limits both known to shift
-    "openrouter": {"requests_per_day": None, "requests_per_minute": None},  # varies per free model, not fixed
-}
-
-
-def compute_quota_status(provider_name, usage, quotas=KNOWN_QUOTAS):
-    """Pure function (no I/O) so it's directly testable: given today's
-    usage {"requests": N, "tokens": M} and the known daily request limit
-    for a provider, return remaining/used/pct, or None if no published
-    daily limit is tracked for that provider."""
-    quota = quotas.get(provider_name)
-    if not quota or not quota.get("requests_per_day"):
-        return None
-    limit = quota["requests_per_day"]
-    used = usage.get("requests", 0)
-    remaining = max(limit - used, 0)
-    pct_used = round((used / limit) * 100, 1) if limit else 0.0
-    return {"limit": limit, "used": used, "remaining": remaining, "pct_used": pct_used}
-
-
-def print_quota_summary(memory_db):
+def print_quota_summary(stats_store):
     from datetime import datetime as _dt, timezone as _tz
-    usage_today = memory_db.get_all_daily_usage()
+    usage_today = stats_store.get_all_daily_usage()
     now = _dt.now(_tz.utc)
     hours_to_reset = 24 - now.hour - (now.minute / 60)
     print(f"\n{_c('Today’s usage (resets ~' + f'{hours_to_reset:.1f}h at UTC midnight):', 'bold')}")
@@ -830,10 +591,31 @@ def build_registry():
             return True
         return False
 
+    def register_discovered(name, model_prefix, api_base, key_env, capabilities, priority, picker,
+                             capability_priority=None):
+        """Same as register_provider, but the model id is looked up live
+        via `picker` (see pick_*_model in providers/adaptive_registry.py)
+        instead of being hardcoded -- so a provider retiring/renaming a
+        model doesn't silently break this file. Skips registration (with
+        a warning) if discovery fails or no key is set."""
+        key = os.getenv(key_env)
+        if not key:
+            return False
+        model_id = picker(key)
+        if not model_id:
+            print(_c(f"   Warning: could not discover a working {name} model "
+                      f"(catalog may have changed) -- skipping {name} this session.", "yellow"))
+            return False
+        registry.register(BaseProvider(name, f"{model_prefix}/{model_id}", api_base, key,
+                                        capabilities, priority, capability_priority))
+        return True
+
     # Groq: fast general-purpose model, primary for both planning and
-    # coding for now.
-    register_provider("groq", "groq/llama-3.3-70b-versatile", "https://api.groq.com/openai/v1",
-                       "GROQ_API_KEY", ["planning", "coding"], priority=10)
+    # coding for now. llama-3.3-70b-versatile (the old hardcoded model)
+    # is deprecated by Groq, shutdown 08/16/2026 -- discovered live now
+    # (see pick_groq_model) instead of hardcoding its replacement.
+    register_discovered("groq", "groq", "https://api.groq.com/openai/v1",
+                         "GROQ_API_KEY", ["planning", "coding"], 10, pick_groq_model)
     # DeepSeek removed for now -- not actually free (per-token paid API),
     # so it shouldn't be a default in a "free/cheap providers" pool.
     # Re-add with capability_priority={"coding": 5} on groq's coding entry
@@ -841,8 +623,18 @@ def build_registry():
     # register_provider("deepseek", "deepseek/deepseek-chat", "https://api.deepseek.com/v1",
     #                    "DEEPSEEK_API_KEY", ["coding", "planning"], priority=20,
     #                    capability_priority={"coding": 5})
-    register_provider("openrouter", "openrouter/meta-llama/llama-3.1-70b-instruct", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", ["answering", "planning"], 30)
-    register_provider("gemini", "gemini/gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", ["answering", "validation"], 40)
+    # OpenRouter: model id is discovered live and restricted to ids
+    # OpenRouter prices at $0 (see pick_openrouter_model) -- the old
+    # hardcoded id (meta-llama/llama-3.1-70b-instruct, no ':free' suffix)
+    # was actually the paid route, which contradicts this being a
+    # free-tier pool.
+    register_discovered("openrouter", "openrouter", "https://openrouter.ai/api/v1",
+                         "OPENROUTER_API_KEY", ["answering", "planning"], 30, pick_openrouter_model)
+    # Gemini: gemini-2.5-flash (the old hardcoded model) is deprecated,
+    # shutdown 10/16/2026, and some accounts report it already failing
+    # ahead of that date -- discovered live now (see pick_gemini_model).
+    register_discovered("gemini", "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/",
+                         "GEMINI_API_KEY", ["answering", "validation"], 40, pick_gemini_model)
     # NVIDIA NIM removed for now -- its free access is a "hosted evaluation
     # endpoint" rather than a confirmed indefinite production free tier.
     # Re-add if you verify your own account's limits are workable:
@@ -851,16 +643,12 @@ def build_registry():
     # meaningful answering fallback. Model name is discovered live
     # (see pick_cerebras_model) rather than hardcoded, since Cerebras's
     # free catalog is known to change without notice.
-    cerebras_key = os.getenv("CEREBRAS_API_KEY")
-    if cerebras_key:
-        cerebras_model = pick_cerebras_model(cerebras_key)
-        if cerebras_model:
-            registry.register(BaseProvider("cerebras", f"cerebras/{cerebras_model}",
-                                            "https://api.cerebras.ai/v1", cerebras_key,
-                                            ["answering"], priority=60))
-        else:
-            print(_c("   Warning: could not discover a working Cerebras model "
-                      "(catalog may have changed) -- skipping Cerebras this session.", "yellow"))
+    register_discovered("cerebras", "cerebras", "https://api.cerebras.ai/v1",
+                         "CEREBRAS_API_KEY", ["answering"], 60, pick_cerebras_model)
+    # Mistral's "-latest" alias is a rolling pointer Mistral itself keeps
+    # pointed at its newest Small model, so unlike the others it doesn't
+    # need live discovery to stay valid -- it can still silently change
+    # behavior/pricing underneath you, just won't 404.
     register_provider("mistral", "mistral/mistral-small-latest", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", ["answering"], 70)
     # Cohere removed for now -- same "free evaluation limits" trial flavor
     # as NVIDIA above, not a clearly indefinite free tier. Re-add if
@@ -869,21 +657,6 @@ def build_registry():
 
     registry.register(BaseProvider("mock", "mock", "", "", ["text_generation"], 999))
     return registry
-
-
-class CostTracker:
-    """Accumulates $ cost across the multiple LLM calls that make up one
-    task (plan + code + N feedback/auto-fix rounds), so it can be shown
-    and saved as a single per-task total."""
-
-    def __init__(self):
-        self.total = 0.0
-        self.calls = 0
-
-    def add(self, cost):
-        if cost:
-            self.total += cost
-        self.calls += 1
 
 
 class SessionContext:
@@ -954,6 +727,7 @@ def main():
         print(f"   - {p.name} (caps: {', '.join(p.capabilities)}, priority {p.priority})")
 
     memory_db = MemoryDB(DB_PATH)
+    stats_store = ProviderStatsStore(STATS_DB_PATH)
     workspace = WorkspaceManager()
     router = MemoryRouter(memory_db)
     replay_manager = ReplayManager(memory_db, workspace)
@@ -967,17 +741,17 @@ def main():
             print("Bye!")
             break
         if goal.lower() == "providers":
-            print_provider_rankings(registry, memory_db)
+            print_provider_rankings(registry, stats_store)
             continue
         if goal.lower() == "reset":
             session.reset()
             print("Conversation context cleared.")
             continue
         if goal.lower() == "cost":
-            print_cost_summary(memory_db)
+            print_cost_summary(stats_store)
             continue
         if goal.lower() == "quota":
-            print_quota_summary(memory_db)
+            print_quota_summary(stats_store)
             continue
 
         task_id = f"task_{uuid.uuid4().hex[:8]}"
@@ -1009,7 +783,7 @@ def main():
         is_question = is_question_or_followup(goal, session)
 
         if is_question:
-            candidates = registry.get_all("answering", memory_db=memory_db)
+            candidates = registry.get_all("answering", stats_store=stats_store)
             if not candidates:
                 print("No provider configured for answering.")
                 continue
@@ -1024,7 +798,7 @@ def main():
                                        "If recent conversation context is given, treat the new message as a "
                                        "follow-up to it unless it clearly changes topic.",
                         max_tokens=512, label="Thinking",
-                        memory_db=memory_db, capability="answering", cost_tracker=cost_tracker,
+                        stats_store=stats_store, capability="answering", cost_tracker=cost_tracker,
                     )
                     memory_db.save_task(task_id=task_id, goal=goal, plan=None, code=None,
                                          answer=answer, provider=provider.name,
@@ -1040,8 +814,8 @@ def main():
             continue
 
         ws_path = workspace.create_workspace(task_id)
-        planner = registry.get_best("planning", memory_db=memory_db)
-        coder = registry.get_best("coding", memory_db=memory_db)
+        planner = registry.get_best("planning", stats_store=stats_store)
+        coder = registry.get_best("coding", stats_store=stats_store)
         if not planner or not coder:
             print("No provider configured for planning/coding.")
             continue
@@ -1050,12 +824,12 @@ def main():
         context = session.as_context()
         plan_prompt = f"{context}Create a short, clear, numbered plan for: {goal}"
         plan = stream_generate(planner, plan_prompt,
-                                max_tokens=1024, label="Planning", memory_db=memory_db, capability="planning",
+                                max_tokens=1024, label="Planning", stats_store=stats_store, capability="planning",
                                 cost_tracker=cost_tracker)
         workspace.save_plan(ws_path, plan)
 
         code, stdout, stderr, provider = run_with_autofix_interactive(
-            goal, plan, coder, workspace, memory_db, task_id, cost_tracker)
+            goal, plan, coder, workspace, stats_store, task_id, cost_tracker)
 
         if cost_tracker.total > 0:
             print(_c(f"Task cost so far: ${cost_tracker.total:.6f} across {cost_tracker.calls} calls", "grey"))

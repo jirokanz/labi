@@ -1,0 +1,277 @@
+"""
+Real provider intelligence -- adaptive per-capability ranking, live model
+discovery (Cerebras, Groq, Gemini, OpenRouter), and quota reference data.
+
+Moved out of agent.py, where this used to live directly inside the CLI
+entrypoint file alongside memory/workspace/replay/session logic (the
+"god object" problem flagged in review). agent.py now imports from here
+instead of defining its own copies.
+
+Named AdaptiveProviderRegistry (not ProviderRegistry) deliberately --
+there's already a simpler ProviderRegistry in providers/registry.py that
+intelligence/router.py depends on, with a different interface (key-based
+get_provider_status/select_best_provider vs. capability-based
+get_best/get_all here). Colliding the names would have been confusing
+even though only one is imported in a given file; keeping them distinct
+makes it unambiguous which "provider registry" a given piece of code
+means. agent.py imports this class aliased as ProviderRegistry for
+backward compatibility with existing call sites and tests.
+"""
+
+import litellm
+
+
+class BaseProvider:
+    def __init__(self, name, model, api_base, api_key, capabilities=None, priority=100,
+                 capability_priority=None):
+        self.name = name
+        self.model = model
+        self.api_base = api_base
+        self.api_key = api_key
+        self.capabilities = capabilities or ["text_generation"]
+        self.priority = priority
+        # Optional per-capability override, e.g. {"coding": 5} to rank this
+        # provider higher for coding specifically without changing its
+        # (possibly lower) rank for other capabilities it also serves.
+        self.capability_priority = capability_priority or {}
+
+    def priority_for(self, capability):
+        return self.capability_priority.get(capability, self.priority)
+
+    def _messages(self, prompt, system_prompt, history):
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def generate(self, prompt, system_prompt=None, max_tokens=768, history=None):
+        messages = self._messages(prompt, system_prompt, history)
+        try:
+            response = litellm.completion(
+                model=self.model, messages=messages, api_base=self.api_base,
+                api_key=self.api_key, max_tokens=max_tokens, temperature=0.3,
+            )
+        except Exception as e:
+            raise Exception(f"Provider {self.name} failed: {e}")
+        usage = response.get("usage", {})
+        return {
+            "content": response.choices[0].message.content,
+            "model": response.model,
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+            "provider": self.name,
+        }
+
+    def generate_stream(self, prompt, system_prompt=None, max_tokens=768, history=None):
+        """Yields text chunks as they arrive, for a live 'vibe coding' feel.
+        Falls back to a single chunk if the provider/model can't stream."""
+        messages = self._messages(prompt, system_prompt, history)
+        try:
+            stream = litellm.completion(
+                model=self.model, messages=messages, api_base=self.api_base,
+                api_key=self.api_key, max_tokens=max_tokens, temperature=0.3,
+                stream=True,
+            )
+            full = []
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    full.append(delta)
+                    yield delta
+            self._last_full = "".join(full)
+        except Exception as e:
+            raise Exception(f"Provider {self.name} failed: {e}")
+
+
+class AdaptiveProviderRegistry:
+    MIN_SAMPLES = 4          # below this, trust the static priority (cold start)
+    LATENCY_PENALTY_PER_SEC = 5  # score points lost per second of avg latency
+
+    def __init__(self):
+        self.providers = []
+
+    def register(self, provider):
+        self.providers.append(provider)
+
+    def _score(self, provider, capability, stats_store):
+        """Higher is better. Blends measured success rate + latency with the
+        static priority as a prior, so a provider with few/no data points
+        still ranks the same as the old hardcoded-priority behavior."""
+        static_score = 1000 - provider.priority_for(capability)  # invert: lower priority number = higher score
+        if stats_store is None:
+            return static_score
+        stats = stats_store.get_provider_stats(provider.name, capability)
+        if not stats or stats["calls"] < self.MIN_SAMPLES:
+            return static_score
+        success_rate = stats["successes"] / stats["calls"]
+        avg_latency_s = stats["total_latency_ms"] / stats["calls"] / 1000
+        # success rate dominates (0-100 range), latency is a tie-breaking penalty
+        return (success_rate * 100) - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC)
+
+    def get_best(self, capability, stats_store=None):
+        candidates = [p for p in self.providers if capability in p.capabilities]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: self._score(p, capability, stats_store), reverse=True)
+        return candidates[0]
+
+    def get_all(self, capability, stats_store=None):
+        candidates = [p for p in self.providers if capability in p.capabilities]
+        candidates.sort(key=lambda p: self._score(p, capability, stats_store), reverse=True)
+        return candidates
+
+
+def _fetch_json(url, headers=None, timeout=5):
+    import urllib.request
+    import json as _json
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return _json.loads(resp.read())
+
+
+def _rank_pick(model_ids, preferred, fallback_to_first=True):
+    """Shared picker for every provider below: given a live list of model
+    ids and an ordered list of preferred name-fragments (best first),
+    return the first model id containing the highest-ranked fragment.
+    Falls back to model_ids[0] -- whatever the API happens to list first
+    -- only if nothing on the preference list matches, since that's still
+    better than hardcoding a name that can silently vanish from a
+    provider's catalog (this is what bit us with Cerebras dropping Llama,
+    and what's about to bite Groq when llama-3.3-70b-versatile is
+    retired 08/16/2026)."""
+    lowered = {mid.lower(): mid for mid in model_ids}
+    for pref in preferred:
+        for low, orig in lowered.items():
+            if pref in low:
+                return orig
+    if fallback_to_first and model_ids:
+        return model_ids[0]
+    return None
+
+
+# Ordered best-first. Update these as providers ship new generations --
+# that's a one-line change here instead of a silent breakage in the field.
+PREFERRED_CEREBRAS_MODELS = [
+    "llama-4", "llama4", "qwen3-235b", "gpt-oss-120b", "qwen3-32b",
+    "zai-glm", "llama-3.3", "llama",
+]
+PREFERRED_GROQ_MODELS = [
+    "gpt-oss-120b", "qwen3.6-27b", "gpt-oss-20b", "llama-3.3", "llama",
+]
+PREFERRED_GEMINI_MODELS = [
+    "gemini-3.5-flash", "gemini-3.1-flash", "gemini-3-flash", "flash",
+]
+PREFERRED_OPENROUTER_MODELS = [
+    "llama-3.3-70b-instruct", "llama-3.1-70b-instruct", "llama",
+]
+
+
+def pick_cerebras_model(api_key, fetch_fn=None):
+    """Cerebras's free-tier model catalog is confirmed to change without
+    notice (one documented case: ~12 models down to 2 within months, same
+    NotFoundError we hit live) -- hardcoding a model name is fragile by
+    design. Query the live /v1/models endpoint and pick a workable one
+    instead of guessing. Returns None (caller should skip registering
+    Cerebras this session) if discovery fails or the catalog is empty."""
+    fetch_fn = fetch_fn or (lambda k: _fetch_json(
+        "https://api.cerebras.ai/v1/models", headers={"Authorization": f"Bearer {k}"}))
+    try:
+        data = fetch_fn(api_key)
+        model_ids = [m["id"] for m in data.get("data", [])]
+    except Exception:
+        return None
+    return _rank_pick(model_ids, PREFERRED_CEREBRAS_MODELS)
+
+
+def pick_groq_model(api_key, fetch_fn=None):
+    """llama-3.3-70b-versatile (the model this used to be hardcoded to)
+    is deprecated by Groq with a shutdown date of 08/16/2026. Discover
+    live instead of re-hardcoding its replacement, so the next rename
+    doesn't require another code change."""
+    fetch_fn = fetch_fn or (lambda k: _fetch_json(
+        "https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {k}"}))
+    try:
+        data = fetch_fn(api_key)
+        model_ids = [m["id"] for m in data.get("data", [])]
+    except Exception:
+        return None
+    return _rank_pick(model_ids, PREFERRED_GROQ_MODELS)
+
+
+def pick_gemini_model(api_key, fetch_fn=None):
+    """gemini-2.5-flash (the model this used to be hardcoded to) is
+    deprecated with an official shutdown of 10/16/2026, and some accounts
+    report it already returning not-found ahead of that date."""
+    fetch_fn = fetch_fn or (lambda k: _fetch_json(
+        f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"))
+    try:
+        data = fetch_fn(api_key)
+        model_ids = [
+            m["name"].split("/", 1)[-1] for m in data.get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])
+        ]
+    except Exception:
+        return None
+    return _rank_pick(model_ids, PREFERRED_GEMINI_MODELS)
+
+
+def pick_openrouter_model(api_key, fetch_fn=None):
+    """OpenRouter lists free and paid variants of the same underlying
+    model under different ids (e.g. an id with a ':free' suffix vs. the
+    bare id, which is billed). The old hardcoded id
+    (meta-llama/llama-3.1-70b-instruct, no ':free' suffix) was actually
+    the *paid* route -- it would have quietly spent OpenRouter credits
+    rather than failing. Restrict candidates to ids OpenRouter itself
+    prices at $0 before ranking, so this stays a free-tier pick no
+    matter what OpenRouter renames things to."""
+    fetch_fn = fetch_fn or (lambda k: _fetch_json(
+        "https://openrouter.ai/api/v1/models", headers={"Authorization": f"Bearer {k}"}))
+    try:
+        data = fetch_fn(api_key)
+        free_ids = []
+        for m in data.get("data", []):
+            pricing = m.get("pricing", {})
+            try:
+                is_free = float(pricing.get("prompt", 1) or 0) == 0 and float(pricing.get("completion", 1) or 0) == 0
+            except (TypeError, ValueError):
+                is_free = False
+            if is_free:
+                free_ids.append(m["id"])
+    except Exception:
+        return None
+    return _rank_pick(free_ids, PREFERRED_OPENROUTER_MODELS)
+
+
+# Best-effort published free-tier limits, as verified at the time these
+# providers were added to this file. These are NOT queried live -- we've
+# already been burned repeatedly by providers changing things without
+# notice (model catalogs, retirements), so treat these numbers as "last
+# known good", not gospel. Re-verify against the provider's own docs if
+# a number here looks suspiciously stale or a quota-based prediction
+# doesn't match what you're actually seeing.
+KNOWN_QUOTAS = {
+    "groq": {"requests_per_day": 1000, "requests_per_minute": 30},
+    "gemini": {"requests_per_day": 1500, "requests_per_minute": 15},
+    "mistral": {"requests_per_day": None, "requests_per_minute": 1},  # "prototyping only" tier, RPM-limited
+    "cerebras": {"requests_per_day": None, "requests_per_minute": None},  # catalog + limits both known to shift
+    "openrouter": {"requests_per_day": None, "requests_per_minute": None},  # varies per free model, not fixed
+}
+
+
+def compute_quota_status(provider_name, usage, quotas=KNOWN_QUOTAS):
+    """Pure function (no I/O) so it's directly testable: given today's
+    usage {"requests": N, "tokens": M} and the known daily request limit
+    for a provider, return remaining/used/pct, or None if no published
+    daily limit is tracked for that provider."""
+    quota = quotas.get(provider_name)
+    if not quota or not quota.get("requests_per_day"):
+        return None
+    limit = quota["requests_per_day"]
+    used = usage.get("requests", 0)
+    remaining = max(limit - used, 0)
+    pct_used = round((used / limit) * 100, 1) if limit else 0.0
+    return {"limit": limit, "used": used, "remaining": remaining, "pct_used": pct_used}

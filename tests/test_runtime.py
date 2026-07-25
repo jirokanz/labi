@@ -143,8 +143,8 @@ def test_config_missing_file_falls_back_to_default():
 # ---- adaptive provider ranking (was static priority only, never updated) ----
 
 def test_provider_stats_recorded_and_retrieved(tmp_path):
-    from labi.agent import MemoryDB
-    db = MemoryDB(str(tmp_path / "mem.db"))
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
     db.record_provider_call("groq", "coding", True, 500)
     db.record_provider_call("groq", "coding", True, 700)
     db.record_provider_call("groq", "coding", False, 900)
@@ -155,8 +155,9 @@ def test_provider_stats_recorded_and_retrieved(tmp_path):
 
 
 def test_registry_falls_back_to_static_priority_below_min_samples(tmp_path):
-    from labi.agent import MemoryDB, BaseProvider, ProviderRegistry
-    db = MemoryDB(str(tmp_path / "mem.db"))
+    from labi.providers.stats import ProviderStatsStore
+    from labi.agent import BaseProvider, ProviderRegistry
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
     registry = ProviderRegistry()
     fast_but_new = BaseProvider("fast", "m", "", "k", ["coding"], priority=50)
     slow_but_established = BaseProvider("slow", "m", "", "k", ["coding"], priority=10)
@@ -165,13 +166,14 @@ def test_registry_falls_back_to_static_priority_below_min_samples(tmp_path):
     # Only 1 data point for "fast" -- below MIN_SAMPLES, so static priority
     # (lower number wins) should still decide the ranking.
     db.record_provider_call("fast", "coding", True, 100)
-    best = registry.get_best("coding", memory_db=db)
+    best = registry.get_best("coding", stats_store=db)
     assert best.name == "slow"
 
 
 def test_registry_prefers_measured_success_once_enough_samples(tmp_path):
-    from labi.agent import MemoryDB, BaseProvider, ProviderRegistry
-    db = MemoryDB(str(tmp_path / "mem.db"))
+    from labi.providers.stats import ProviderStatsStore
+    from labi.agent import BaseProvider, ProviderRegistry
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
     registry = ProviderRegistry()
     unreliable_but_prioritized = BaseProvider("unreliable", "m", "", "k", ["coding"], priority=10)
     reliable_but_deprioritized = BaseProvider("reliable", "m", "", "k", ["coding"], priority=90)
@@ -183,7 +185,7 @@ def test_registry_prefers_measured_success_once_enough_samples(tmp_path):
     for _ in range(10):
         db.record_provider_call("reliable", "coding", True, 200)
 
-    best = registry.get_best("coding", memory_db=db)
+    best = registry.get_best("coding", stats_store=db)
     assert best.name == "reliable"
 
 
@@ -268,9 +270,9 @@ def test_cost_tracker_accumulates():
     assert ct.calls == 3
 
 
-def test_memory_db_records_and_sums_cost(tmp_path):
-    from labi.agent import MemoryDB
-    db = MemoryDB(str(tmp_path / "mem.db"))
+def test_provider_stats_store_records_and_sums_cost(tmp_path):
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
     db.record_provider_call("groq", "coding", True, 500, cost_usd=0.001)
     db.record_provider_call("groq", "coding", True, 500, cost_usd=0.002)
     db.record_provider_call("deepseek", "coding", True, 500, cost_usd=0.0005)
@@ -343,41 +345,83 @@ def test_classifier_low_risk_for_benign_goal():
     assert profile.risk == RiskLevel.LOW
 
 
-# ---- Cerebras live model discovery (was a hardcoded name that went stale) ----
+# ---- Live model discovery for all providers (was hardcoded names that went stale) ----
 
-def test_pick_cerebras_model_prefers_llama():
-    from labi.agent import pick_cerebras_model
-    fake_response = {"data": [{"id": "gpt-oss-120b"}, {"id": "llama-3.3-70b"}, {"id": "zai-glm-4.7"}]}
-    result = pick_cerebras_model("fake-key", fetch_fn=lambda key: fake_response)
-    assert result == "llama-3.3-70b"
-
-
-def test_pick_cerebras_model_falls_back_to_first_when_no_llama():
-    from labi.agent import pick_cerebras_model
-    fake_response = {"data": [{"id": "gpt-oss-120b"}, {"id": "zai-glm-4.7"}]}
+def test_pick_cerebras_model_prefers_gpt_oss_over_llama():
+    # gpt-oss-120b now outranks llama-3.3 in PREFERRED_CEREBRAS_MODELS,
+    # since Cerebras has since dropped Llama from its free-tier catalog
+    # entirely -- "prefer llama" was the stale assumption this replaced.
+    from labi.providers.adaptive_registry import pick_cerebras_model
+    fake_response = {"data": [{"id": "llama-3.3-70b"}, {"id": "gpt-oss-120b"}, {"id": "zai-glm-4.7"}]}
     result = pick_cerebras_model("fake-key", fetch_fn=lambda key: fake_response)
     assert result == "gpt-oss-120b"
 
 
+def test_pick_cerebras_model_falls_back_to_first_when_nothing_preferred():
+    from labi.providers.adaptive_registry import pick_cerebras_model
+    fake_response = {"data": [{"id": "some-brand-new-model"}, {"id": "another-one"}]}
+    result = pick_cerebras_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result == "some-brand-new-model"
+
+
 def test_pick_cerebras_model_returns_none_on_empty_catalog():
-    from labi.agent import pick_cerebras_model
+    from labi.providers.adaptive_registry import pick_cerebras_model
     result = pick_cerebras_model("fake-key", fetch_fn=lambda key: {"data": []})
     assert result is None
 
 
 def test_pick_cerebras_model_returns_none_on_fetch_failure():
-    from labi.agent import pick_cerebras_model
+    from labi.providers.adaptive_registry import pick_cerebras_model
     def broken_fetch(key):
         raise ConnectionError("simulated network failure")
     result = pick_cerebras_model("fake-key", fetch_fn=broken_fetch)
     assert result is None
 
 
+def test_pick_groq_model_prefers_gpt_oss_over_deprecated_llama():
+    # llama-3.3-70b-versatile (the old hardcoded model) is deprecated by
+    # Groq, shutdown 08/16/2026.
+    from labi.providers.adaptive_registry import pick_groq_model
+    fake_response = {"data": [{"id": "llama-3.3-70b-versatile"}, {"id": "openai/gpt-oss-120b"}]}
+    result = pick_groq_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result == "openai/gpt-oss-120b"
+
+
+def test_pick_gemini_model_prefers_3_5_flash_and_filters_non_generative():
+    from labi.providers.adaptive_registry import pick_gemini_model
+    fake_response = {"models": [
+        {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/gemini-3.5-flash", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/embedding-001", "supportedGenerationMethods": ["embedContent"]},
+    ]}
+    result = pick_gemini_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result == "gemini-3.5-flash"
+
+
+def test_pick_openrouter_model_excludes_paid_variant():
+    # The old hardcoded id had no ':free' suffix, i.e. it was the paid
+    # route. This must never be picked even if it's ranked first by name.
+    from labi.providers.adaptive_registry import pick_openrouter_model
+    fake_response = {"data": [
+        {"id": "meta-llama/llama-3.1-70b-instruct", "pricing": {"prompt": "0.0000009", "completion": "0.0000009"}},
+        {"id": "meta-llama/llama-3.3-70b-instruct:free", "pricing": {"prompt": "0", "completion": "0"}},
+    ]}
+    result = pick_openrouter_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result == "meta-llama/llama-3.3-70b-instruct:free"
+
+
+def test_pick_openrouter_model_returns_none_when_no_free_models():
+    from labi.providers.adaptive_registry import pick_openrouter_model
+    fake_response = {"data": [{"id": "some/paid-model", "pricing": {"prompt": "0.001", "completion": "0.001"}}]}
+    result = pick_openrouter_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result is None
+
+
 # ---- daily usage / quota tracking ----
 
 def test_record_and_get_daily_usage(tmp_path):
-    from labi.agent import MemoryDB
-    db = MemoryDB(str(tmp_path / "mem.db"))
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
     db.record_daily_usage("groq", tokens=1500, requests=1, day="2026-07-24")
     db.record_daily_usage("groq", tokens=2000, requests=1, day="2026-07-24")
     db.record_daily_usage("groq", tokens=500, requests=1, day="2026-07-23")  # different day, separate bucket
@@ -387,8 +431,8 @@ def test_record_and_get_daily_usage(tmp_path):
 
 
 def test_get_all_daily_usage_scoped_to_one_day(tmp_path):
-    from labi.agent import MemoryDB
-    db = MemoryDB(str(tmp_path / "mem.db"))
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
     db.record_daily_usage("groq", tokens=100, requests=1, day="2026-07-24")
     db.record_daily_usage("gemini", tokens=200, requests=1, day="2026-07-24")
     db.record_daily_usage("groq", tokens=999, requests=1, day="2026-07-01")
