@@ -170,8 +170,29 @@ def _rank_pick(model_ids, preferred, fallback_to_first=True):
     return None
 
 
-# Ordered best-first. Update these as providers ship new generations --
-# that's a one-line change here instead of a silent breakage in the field.
+# Explicit denylist, checked before ranking: models confirmed
+# deprecated/paid-only that should never be picked even as a last-resort
+# fallback (i.e. even if every entry in the matching PREFERRED_* list is
+# absent from the catalog and _rank_pick would otherwise fall back to
+# "whatever's listed first"). The preference lists above already push
+# these to the back of the ranking, but that's not a guarantee they're
+# never selected -- a denylist is.
+AVOID_MODELS = {
+    "cerebras": set(),  # nothing confirmed deprecated as of this writing
+    "groq": {
+        "llama-3.3-70b-versatile",  # deprecated by Groq, shutdown 08/16/2026
+        "llama-3.1-8b-instant",     # deprecated by Groq, same announcement
+    },
+    "gemini": {
+        "gemini-2.5-flash",  # deprecated, shutdown 10/16/2026, some accounts already failing early
+    },
+    "openrouter": set(),  # the $0-pricing filter already excludes paid variants
+}
+
+
+def _filter_avoid(model_ids, provider_key):
+    avoid = AVOID_MODELS.get(provider_key, set())
+    return [m for m in model_ids if m not in avoid]
 PREFERRED_CEREBRAS_MODELS = [
     "llama-4", "llama4", "qwen3-235b", "gpt-oss-120b", "qwen3-32b",
     "zai-glm", "llama-3.3", "llama",
@@ -198,7 +219,7 @@ def pick_cerebras_model(api_key, fetch_fn=None):
         "https://api.cerebras.ai/v1/models", headers={"Authorization": f"Bearer {k}"}))
     try:
         data = fetch_fn(api_key)
-        model_ids = [m["id"] for m in data.get("data", [])]
+        model_ids = _filter_avoid([m["id"] for m in data.get("data", [])], "cerebras")
     except Exception as e:
         LAST_DISCOVERY_ERROR["cerebras"] = f"{type(e).__name__}: {e}"
         return None
@@ -218,7 +239,7 @@ def pick_groq_model(api_key, fetch_fn=None):
         "https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {k}"}))
     try:
         data = fetch_fn(api_key)
-        model_ids = [m["id"] for m in data.get("data", [])]
+        model_ids = _filter_avoid([m["id"] for m in data.get("data", [])], "groq")
     except Exception as e:
         LAST_DISCOVERY_ERROR["groq"] = f"{type(e).__name__}: {e}"
         return None
@@ -237,10 +258,10 @@ def pick_gemini_model(api_key, fetch_fn=None):
         f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"))
     try:
         data = fetch_fn(api_key)
-        model_ids = [
+        model_ids = _filter_avoid([
             m["name"].split("/", 1)[-1] for m in data.get("models", [])
             if "generateContent" in m.get("supportedGenerationMethods", [])
-        ]
+        ], "gemini")
     except Exception as e:
         LAST_DISCOVERY_ERROR["gemini"] = f"{type(e).__name__}: {e}"
         return None
@@ -276,6 +297,7 @@ def pick_openrouter_model(api_key, fetch_fn=None):
     except Exception as e:
         LAST_DISCOVERY_ERROR["openrouter"] = f"{type(e).__name__}: {e}"
         return None
+    free_ids = _filter_avoid(free_ids, "openrouter")
     if not free_ids:
         LAST_DISCOVERY_ERROR["openrouter"] = "no $0-priced models found in catalog"
         return None

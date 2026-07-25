@@ -55,8 +55,15 @@ from labi.providers.cost import CostTracker
 load_dotenv()
 
 # ---------- Configuration ----------
-DB_PATH = os.getenv("LABI_DB_PATH", "memory.db")
-STATS_DB_PATH = os.getenv("LABI_STATS_DB_PATH", "provider_stats.db")
+# Anchored to a fixed location under $HOME (matching WORKSPACE_ROOT below),
+# not the current working directory -- otherwise running 'labi' from
+# different directories (e.g. via the global /usr/local/bin/labi wrapper,
+# which doesn't cd anywhere) silently fragments provider stats and memory
+# across whichever cwd you happened to be in each time.
+_LABI_STATE_DIR = Path.home() / "labi" / "state"
+_LABI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = os.getenv("LABI_DB_PATH", str(_LABI_STATE_DIR / "memory.db"))
+STATS_DB_PATH = os.getenv("LABI_STATS_DB_PATH", str(_LABI_STATE_DIR / "provider_stats.db"))
 WORKSPACE_ROOT = Path.home() / "labi" / "workspace"
 MAX_FIX_ATTEMPTS = 3
 EXECUTION_TIMEOUT = 20
@@ -630,8 +637,18 @@ def build_registry():
     # hardcoded id (meta-llama/llama-3.1-70b-instruct, no ':free' suffix)
     # was actually the paid route, which contradicts this being a
     # free-tier pool.
+    # Also given "coding" and "validation" here as a fallback: previously
+    # coding had only Groq and validation had only Gemini, so either
+    # one's key being bad or its discovery failing dropped that whole
+    # capability straight to the offline mock with no live LLM at all.
+    # capability_priority pins OpenRouter behind validation's primary
+    # (Gemini, 40) -- without this override OpenRouter's general priority
+    # (30) would rank AHEAD of Gemini for validation, which is backwards;
+    # coding needs no override since OpenRouter's 30 is already behind
+    # Groq's 10.
     register_discovered("openrouter", "openrouter", "https://openrouter.ai/api/v1",
-                         "OPENROUTER_API_KEY", ["answering", "planning"], 30, pick_openrouter_model)
+                         "OPENROUTER_API_KEY", ["answering", "planning", "coding", "validation"], 30,
+                         pick_openrouter_model, capability_priority={"validation": 45})
     # Gemini: gemini-2.5-flash (the old hardcoded model) is deprecated,
     # shutdown 10/16/2026, and some accounts report it already failing
     # ahead of that date -- discovered live now (see pick_gemini_model).

@@ -387,6 +387,25 @@ def test_pick_groq_model_prefers_gpt_oss_over_deprecated_llama():
     assert result == "openai/gpt-oss-120b"
 
 
+def test_pick_groq_model_never_picks_deprecated_model_even_as_only_option():
+    # The denylist is a second layer beyond preference ordering: even if
+    # a deprecated model is the ONLY thing in the catalog (so ranking
+    # alone would fall back to picking it), it must never be selected.
+    from labi.providers.adaptive_registry import pick_groq_model
+    fake_response = {"data": [{"id": "llama-3.3-70b-versatile"}, {"id": "llama-3.1-8b-instant"}]}
+    result = pick_groq_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result is None
+
+
+def test_pick_gemini_model_never_picks_deprecated_2_5_flash():
+    from labi.providers.adaptive_registry import pick_gemini_model
+    fake_response = {"models": [
+        {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+    ]}
+    result = pick_gemini_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result is None
+
+
 def test_pick_gemini_model_prefers_3_5_flash_and_filters_non_generative():
     from labi.providers.adaptive_registry import pick_gemini_model
     fake_response = {"models": [
