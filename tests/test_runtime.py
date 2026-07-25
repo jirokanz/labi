@@ -574,3 +574,70 @@ def test_estimate_tokens_rough_heuristic():
     from labi.agent import estimate_tokens
     assert estimate_tokens("") == 0
     assert estimate_tokens("a" * 400) == 100
+
+
+# ---- Quota-aware scoring ----
+
+def test_quota_factor_no_dampening_at_zero_usage(tmp_path):
+    from labi.agent import BaseProvider, ProviderRegistry
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
+    registry = ProviderRegistry()
+    groq = BaseProvider("groq", "m", "", "k", ["coding"])
+    assert registry._quota_factor(groq, db) == 1.0
+
+
+def test_quota_factor_dampens_as_usage_climbs(tmp_path):
+    from labi.agent import BaseProvider, ProviderRegistry
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
+    registry = ProviderRegistry()
+    groq = BaseProvider("groq", "m", "", "k", ["coding"])  # known 1000/day in KNOWN_QUOTAS
+    db.record_daily_usage("groq", tokens=1, requests=500)  # 50% used
+    assert registry._quota_factor(groq, db) == 0.5
+
+
+def test_quota_factor_floors_out_instead_of_hitting_zero(tmp_path):
+    from labi.agent import BaseProvider, ProviderRegistry
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
+    registry = ProviderRegistry()
+    groq = BaseProvider("groq", "m", "", "k", ["coding"])
+    db.record_daily_usage("groq", tokens=1, requests=1500)  # 150% -- over the cap
+    factor = registry._quota_factor(groq, db)
+    assert factor == ProviderRegistry.QUOTA_DAMPEN_FLOOR  # never fully excluded, just heavily damped
+
+
+def test_quota_factor_never_dampens_provider_with_unknown_daily_limit(tmp_path):
+    from labi.agent import BaseProvider, ProviderRegistry
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
+    registry = ProviderRegistry()
+    # "openrouter" has no requests_per_day entry in KNOWN_QUOTAS
+    openrouter = BaseProvider("openrouter", "m", "", "k", ["coding"])
+    db.record_daily_usage("openrouter", tokens=1, requests=1_000_000)  # absurd usage, doesn't matter
+    assert registry._quota_factor(openrouter, db) == 1.0
+
+
+def test_quota_factor_returns_full_score_with_no_stats_store():
+    from labi.agent import BaseProvider, ProviderRegistry
+    registry = ProviderRegistry()
+    groq = BaseProvider("groq", "m", "", "k", ["coding"])
+    assert registry._quota_factor(groq, None) == 1.0
+
+
+def test_registry_prefers_provider_with_more_quota_remaining(tmp_path):
+    """Integration-level check: same priority, but the one nearing its
+    known daily cap loses out to an equally-ranked provider whose limit
+    we don't track (and therefore never dampen)."""
+    from labi.agent import BaseProvider, ProviderRegistry
+    from labi.providers.stats import ProviderStatsStore
+    db = ProviderStatsStore(str(tmp_path / "stats.db"))
+    registry = ProviderRegistry()
+    nearly_exhausted = BaseProvider("groq", "m", "", "k", ["coding"], priority=10)
+    unknown_limit = BaseProvider("openrouter", "m", "", "k", ["coding"], priority=10)
+    registry.register(nearly_exhausted)
+    registry.register(unknown_limit)
+    db.record_daily_usage("groq", tokens=1, requests=950)  # 95% of its known 1000/day cap
+    best = registry.get_best("coding", stats_store=db)
+    assert best.name == "openrouter"

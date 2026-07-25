@@ -619,7 +619,9 @@ def print_provider_rankings(registry, stats_store):
             else:
                 detail = f"no data yet -- using static priority ({p.priority_for(cap)})"
             ctx = f", {p.context_window // 1000}K context" if p.context_window else ""
-            print(f"    {rank}. {p.name:12s} {_c(detail + ctx, 'grey')}")
+            quota_factor = registry._quota_factor(p, stats_store)
+            quota_note = f", quota-dampened {quota_factor:.0%}" if quota_factor < 1.0 else ""
+            print(f"    {rank}. {p.name:12s} {_c(detail + ctx + quota_note, 'grey')}")
 
 
 def print_cost_summary(stats_store):

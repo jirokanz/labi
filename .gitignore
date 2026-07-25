@@ -4,8 +4,8 @@ __pycache__/
 .env
 *.egg-info/
 .pytest_cache/
+validation.db
+memory.db
+*.pyc
 apply_full_code.py
 validation_workspace/
-.DS_Store
-.AppleDouble
-.Trashes

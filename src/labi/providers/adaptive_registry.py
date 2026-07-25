@@ -97,6 +97,12 @@ class BaseProvider:
 class AdaptiveProviderRegistry:
     MIN_SAMPLES = 4          # below this, trust the static priority (cold start)
     LATENCY_PENALTY_PER_SEC = 5  # score points lost per second of avg latency
+    QUOTA_DAMPEN_FLOOR = 0.05  # never fully zero out a provider on quota alone --
+                                # our tracked usage can undercount real usage
+                                # (same key used outside this app), and a daily
+                                # cap resets on its own, so "at the cap" isn't a
+                                # hard guarantee of failure -- keep it as a
+                                # last resort rather than excluding it outright.
 
     def __init__(self):
         self.providers = []
@@ -104,20 +110,42 @@ class AdaptiveProviderRegistry:
     def register(self, provider):
         self.providers.append(provider)
 
+    def _quota_factor(self, provider, stats_store):
+        """Multiplicative dampening (QUOTA_DAMPEN_FLOOR..1.0) based on how
+        close this provider is to its known daily request cap. Providers
+        with no published daily limit (OpenRouter, Cerebras, Mistral --
+        see KNOWN_QUOTAS) are never dampened; there's no reliable number
+        to judge them against, and guessing one would be exactly the kind
+        of unverified-limit mistake we've already been burned by."""
+        if stats_store is None:
+            return 1.0
+        usage = stats_store.get_daily_usage(provider.name)
+        status = compute_quota_status(provider.name, usage)
+        if status is None:
+            return 1.0
+        pct = min(status["pct_used"], 100.0) / 100.0
+        return max(self.QUOTA_DAMPEN_FLOOR, 1.0 - pct)
+
     def _score(self, provider, capability, stats_store):
         """Higher is better. Blends measured success rate + latency with the
         static priority as a prior, so a provider with few/no data points
-        still ranks the same as the old hardcoded-priority behavior."""
+        still ranks the same as the old hardcoded-priority behavior. Quota
+        headroom then dampens whichever base score, applied uniformly so a
+        provider nearing its daily cap gets deprioritized regardless of how
+        good its priority/success/latency numbers look in isolation."""
         static_score = 1000 - provider.priority_for(capability)  # invert: lower priority number = higher score
         if stats_store is None:
-            return static_score
-        stats = stats_store.get_provider_stats(provider.name, capability)
-        if not stats or stats["calls"] < self.MIN_SAMPLES:
-            return static_score
-        success_rate = stats["successes"] / stats["calls"]
-        avg_latency_s = stats["total_latency_ms"] / stats["calls"] / 1000
-        # success rate dominates (0-100 range), latency is a tie-breaking penalty
-        return (success_rate * 100) - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC)
+            base = static_score
+        else:
+            stats = stats_store.get_provider_stats(provider.name, capability)
+            if not stats or stats["calls"] < self.MIN_SAMPLES:
+                base = static_score
+            else:
+                success_rate = stats["successes"] / stats["calls"]
+                avg_latency_s = stats["total_latency_ms"] / stats["calls"] / 1000
+                # success rate dominates (0-100 range), latency is a tie-breaking penalty
+                base = (success_rate * 100) - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC)
+        return base * self._quota_factor(provider, stats_store)
 
     def _fits(self, provider, min_context):
         if min_context is None or provider.context_window is None:

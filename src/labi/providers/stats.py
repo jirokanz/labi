@@ -10,7 +10,7 @@ provider layer owns its own data.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class ProviderStatsStore:
@@ -79,7 +79,7 @@ class ProviderStatsStore:
     # ---- daily request/token usage (for quota tracking) ----
 
     def record_daily_usage(self, provider, tokens, requests=1, day=None):
-        day = day or datetime.utcnow().strftime("%Y-%m-%d")
+        day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.conn.execute(
             "INSERT INTO daily_usage (provider, day, requests, tokens) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(provider, day) DO UPDATE SET "
@@ -89,7 +89,7 @@ class ProviderStatsStore:
         self.conn.commit()
 
     def get_daily_usage(self, provider, day=None):
-        day = day or datetime.utcnow().strftime("%Y-%m-%d")
+        day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cur = self.conn.execute(
             "SELECT requests, tokens FROM daily_usage WHERE provider=? AND day=?",
             (provider, day),
@@ -98,6 +98,6 @@ class ProviderStatsStore:
         return {"requests": row[0], "tokens": row[1]} if row else {"requests": 0, "tokens": 0}
 
     def get_all_daily_usage(self, day=None):
-        day = day or datetime.utcnow().strftime("%Y-%m-%d")
+        day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cur = self.conn.execute("SELECT provider, requests, tokens FROM daily_usage WHERE day=?", (day,))
         return {r[0]: {"requests": r[1], "tokens": r[2]} for r in cur.fetchall()}
