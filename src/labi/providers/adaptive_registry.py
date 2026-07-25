@@ -128,9 +128,26 @@ class AdaptiveProviderRegistry:
 def _fetch_json(url, headers=None, timeout=5):
     import urllib.request
     import json as _json
-    req = urllib.request.Request(url, headers=headers or {})
+    # Without a browser/curl-like User-Agent, urllib sends the default
+    # "Python-urllib/3.x", which some providers' bot-protection/WAF
+    # blocks or rate-limits more aggressively than others -- this was
+    # missing here (though present in the original check_cerebras_v3.py
+    # script) and is the likely cause of Groq/Cerebras discovery failing
+    # in the field while OpenRouter/Gemini/Mistral succeeded.
+    merged_headers = {"User-Agent": "curl/8.0", **(headers or {})}
+    req = urllib.request.Request(url, headers=merged_headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return _json.loads(resp.read())
+
+
+# Populated with the last real exception per provider whenever discovery
+# fails, so callers (see agent.py's register_discovered) can print an
+# actual reason instead of just "could not discover a working model" --
+# that message alone doesn't distinguish an auth failure, a network
+# error, and an empty catalog, which made this hard to diagnose in the
+# field (see conversation: Groq/Cerebras failing silently on a Pi while
+# OpenRouter/Gemini/Mistral worked).
+LAST_DISCOVERY_ERROR = {}
 
 
 def _rank_pick(model_ids, preferred, fallback_to_first=True):
@@ -182,8 +199,13 @@ def pick_cerebras_model(api_key, fetch_fn=None):
     try:
         data = fetch_fn(api_key)
         model_ids = [m["id"] for m in data.get("data", [])]
-    except Exception:
+    except Exception as e:
+        LAST_DISCOVERY_ERROR["cerebras"] = f"{type(e).__name__}: {e}"
         return None
+    if not model_ids:
+        LAST_DISCOVERY_ERROR["cerebras"] = "catalog returned zero models"
+        return None
+    LAST_DISCOVERY_ERROR.pop("cerebras", None)
     return _rank_pick(model_ids, PREFERRED_CEREBRAS_MODELS)
 
 
@@ -197,8 +219,13 @@ def pick_groq_model(api_key, fetch_fn=None):
     try:
         data = fetch_fn(api_key)
         model_ids = [m["id"] for m in data.get("data", [])]
-    except Exception:
+    except Exception as e:
+        LAST_DISCOVERY_ERROR["groq"] = f"{type(e).__name__}: {e}"
         return None
+    if not model_ids:
+        LAST_DISCOVERY_ERROR["groq"] = "catalog returned zero models"
+        return None
+    LAST_DISCOVERY_ERROR.pop("groq", None)
     return _rank_pick(model_ids, PREFERRED_GROQ_MODELS)
 
 
@@ -214,8 +241,13 @@ def pick_gemini_model(api_key, fetch_fn=None):
             m["name"].split("/", 1)[-1] for m in data.get("models", [])
             if "generateContent" in m.get("supportedGenerationMethods", [])
         ]
-    except Exception:
+    except Exception as e:
+        LAST_DISCOVERY_ERROR["gemini"] = f"{type(e).__name__}: {e}"
         return None
+    if not model_ids:
+        LAST_DISCOVERY_ERROR["gemini"] = "catalog returned zero generateContent-capable models"
+        return None
+    LAST_DISCOVERY_ERROR.pop("gemini", None)
     return _rank_pick(model_ids, PREFERRED_GEMINI_MODELS)
 
 
@@ -241,8 +273,13 @@ def pick_openrouter_model(api_key, fetch_fn=None):
                 is_free = False
             if is_free:
                 free_ids.append(m["id"])
-    except Exception:
+    except Exception as e:
+        LAST_DISCOVERY_ERROR["openrouter"] = f"{type(e).__name__}: {e}"
         return None
+    if not free_ids:
+        LAST_DISCOVERY_ERROR["openrouter"] = "no $0-priced models found in catalog"
+        return None
+    LAST_DISCOVERY_ERROR.pop("openrouter", None)
     return _rank_pick(free_ids, PREFERRED_OPENROUTER_MODELS)
 
 

@@ -47,6 +47,7 @@ from labi.providers.adaptive_registry import (
     pick_openrouter_model,
     KNOWN_QUOTAS,
     compute_quota_status,
+    LAST_DISCOVERY_ERROR,
 )
 from labi.providers.stats import ProviderStatsStore
 from labi.providers.cost import CostTracker
@@ -603,8 +604,9 @@ def build_registry():
             return False
         model_id = picker(key)
         if not model_id:
+            reason = LAST_DISCOVERY_ERROR.get(name, "unknown reason")
             print(_c(f"   Warning: could not discover a working {name} model "
-                      f"(catalog may have changed) -- skipping {name} this session.", "yellow"))
+                      f"({reason}) -- skipping {name} this session.", "yellow"))
             return False
         registry.register(BaseProvider(name, f"{model_prefix}/{model_id}", api_base, key,
                                         capabilities, priority, capability_priority))
