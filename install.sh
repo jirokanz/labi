@@ -29,7 +29,12 @@ if [ ! -f ".env" ] && [ -f ".env.example" ]; then
     echo "  cp .env.example .env"
 fi
 
-if [ "$1" == "--global" ]; then
+if [ "$1" == "--local" ]; then
+    echo
+    echo "Installation complete (local venv only)."
+    echo "Activate with: source venv/bin/activate"
+    echo "Or re-run this script without --local to also install a system-wide 'labi' command."
+else
     echo
     echo "Setting up system-wide 'labi' command (requires sudo)..."
     sudo tee /usr/local/bin/labi > /dev/null << EOF
@@ -38,9 +43,5 @@ exec "$SCRIPT_DIR/venv/bin/python" -m labi.cli "\$@"
 EOF
     sudo chmod +x /usr/local/bin/labi
     echo "Done -- 'labi' is now available from any shell, no activation needed."
-else
-    echo
-    echo "Installation complete."
-    echo "Activate with: source venv/bin/activate"
-    echo "Or re-run this script with --global to install a system-wide 'labi' command instead."
+    echo "(Run this script with --local instead if you don't want a system-wide command / don't have sudo.)"
 fi

@@ -6,16 +6,23 @@ Shows, in order:
   1. The full live model catalog per provider (not just what got picked)
   2. What labi's discovery would actually select right now, or why it failed
   3. Quota status: known daily limits vs. today's tracked usage
-  4. Measured performance from past labi runs (success rate, latency, cost)
-  5. The actual current routing per task type -- which provider+model
+  4. Token/credit balance: live, direct from each provider's own API where
+     one is exposed (OpenRouter has a real balance endpoint; Groq/Cerebras
+     expose it via rate-limit response headers on a minimal chat call;
+     Gemini/Mistral don't expose this at all, and are reported as such)
+  5. Measured performance from past labi runs (success rate, latency, cost)
+  6. The actual current routing per task type -- which provider+model
      handles coding/planning/answering/validation right now, in priority
      order, using the exact same registry/scoring logic as `labi run`
 
 Run from the repo root with the venv active:
     python3 troubleshoot_providers.py
 """
+import json
 import os
 import sys
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
@@ -110,8 +117,126 @@ def show_quota():
                   f"({status['pct_used']}%), {status['remaining']} remaining")
 
 
+def _post_json(url, payload, headers=None, timeout=10):
+    """POST helper for the minimal chat-completion probe below -- separate
+    from _fetch_json (GET-only, imported from adaptive_registry) since
+    nothing in the real labi package needs a POST helper, only this
+    troubleshooting probe does. Rate-limit headers on OpenAI-compatible
+    APIs are sometimes only sent on error responses too, so this reads
+    headers off both the success and HTTPError paths, not just 200."""
+    merged_headers = {"User-Agent": "curl/8.0", "Content-Type": "application/json", **(headers or {})}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=merged_headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read()), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+        except Exception:
+            body = {}
+        return body, dict(e.headers or {})
+
+
+def _rate_limit_headers(headers):
+    """Pull out whichever of the common x-ratelimit-* token headers a
+    provider actually sent -- names aren't fully standardized, so this
+    checks a few known variants rather than assuming one exact set."""
+    lowered = {k.lower(): v for k, v in (headers or {}).items()}
+    out = {}
+    for key in ("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
+                "x-ratelimit-reset-tokens", "x-ratelimit-limit-requests",
+                "x-ratelimit-remaining-requests", "x-ratelimit-reset-requests"):
+        if key in lowered:
+            out[key] = lowered[key]
+    return out
+
+
+def fetch_token_balance(name, key, model_id=None):
+    """Returns a dict describing token/credit balance, or None if this
+    provider doesn't expose one at all. Never raises -- failures are
+    folded into the returned dict as an 'error' key."""
+    if name == "openrouter":
+        try:
+            data = _fetch_json("https://openrouter.ai/api/v1/auth/key",
+                                headers={"Authorization": f"Bearer {key}"})
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        info = data.get("data", {})
+        limit = info.get("limit")
+        usage = info.get("usage")
+        return {
+            "kind": "credit_usd",
+            "limit": limit,  # None means no hard limit set on this key
+            "used": usage,
+            "remaining": (limit - usage) if (limit is not None and usage is not None) else None,
+            "is_free_tier": info.get("is_free_tier"),
+        }
+
+    if name in ("groq", "cerebras"):
+        # The /models list endpoint does NOT return rate-limit headers on
+        # either provider -- only chat completion responses do (standard
+        # for OpenAI-compatible APIs). This costs a trivial sliver of real
+        # quota (max_tokens=1) to check, unlike every read-only call above.
+        if not model_id:
+            return {"kind": "rate_limit_headers",
+                    "error": "no model available to probe with (discovery failed above)"}
+        url = ("https://api.groq.com/openai/v1/chat/completions" if name == "groq"
+               else "https://api.cerebras.ai/v1/chat/completions")
+        payload = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+        try:
+            _, headers = _post_json(url, payload, headers={"Authorization": f"Bearer {key}"})
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        rl = _rate_limit_headers(headers)
+        if not rl:
+            return {"kind": "rate_limit_headers",
+                     "error": "chat-completion response returned no rate-limit headers either"}
+        return {"kind": "rate_limit_headers", **rl}
+
+    # gemini, mistral: no per-key balance or quota exposed via the API at all
+    return None
+
+
+def show_token_balance():
+    section("4. Token / credit balance (live, direct from each provider)")
+    print("  (groq/cerebras checks below spend 1 real token each via a minimal chat call;")
+    print("   openrouter checks are free/read-only; gemini/mistral don't expose this)")
+    pickers = {"groq": pick_groq_model, "cerebras": pick_cerebras_model}
+    for name in ("cerebras", "groq", "gemini", "openrouter", "mistral"):
+        key = os.environ.get(f"{name.upper()}_API_KEY", "")
+        if not key:
+            print(f"  {name}: no key set -- skipped")
+            continue
+        model_id = pickers[name](key) if name in pickers else None
+        balance = fetch_token_balance(name, key, model_id=model_id)
+        if balance is None:
+            print(f"  {name}: not available -- this provider doesn't expose a per-key "
+                  f"balance or quota through its API")
+        elif "error" in balance and balance.get("kind") != "rate_limit_headers":
+            print(f"  {name}: FAILED -- {balance['error']}")
+        elif balance.get("kind") == "credit_usd":
+            tier = " (free tier key)" if balance.get("is_free_tier") else ""
+            if balance["limit"] is None:
+                print(f"  {name}: ${balance['used'] or 0:.4f} used so far, no hard limit set on this key{tier}")
+            else:
+                print(f"  {name}: ${balance['used'] or 0:.4f} used / ${balance['limit']:.4f} limit "
+                      f"(${balance['remaining']:.4f} remaining){tier}")
+        elif balance.get("kind") == "rate_limit_headers":
+            if "error" in balance:
+                print(f"  {name}: {balance['error']}")
+            else:
+                remaining_t = balance.get("x-ratelimit-remaining-tokens")
+                limit_t = balance.get("x-ratelimit-limit-tokens")
+                reset_t = balance.get("x-ratelimit-reset-tokens")
+                if remaining_t is not None or limit_t is not None:
+                    print(f"  {name}: {remaining_t or '?'}/{limit_t or '?'} tokens remaining"
+                          + (f" (resets in {reset_t})" if reset_t else ""))
+                else:
+                    print(f"  {name}: no token-specific headers, only request-count headers: {balance}")
+
+
 def show_measured_performance():
-    section("4. Measured performance (from past labi runs, if any)")
+    section("5. Measured performance (from past labi runs, if any)")
     stats_store = ProviderStatsStore(STATS_DB_PATH)
     all_stats = stats_store.get_all_provider_stats()
     if not all_stats:
@@ -128,7 +253,7 @@ def show_measured_performance():
 
 
 def show_task_routing():
-    section("5. Current routing per task type (same logic as `labi run`)")
+    section("6. Current routing per task type (same logic as `labi run`)")
     registry = build_registry()
     stats_store = ProviderStatsStore(STATS_DB_PATH)
     for cap in CAPABILITIES:
@@ -146,9 +271,10 @@ if __name__ == "__main__":
     show_raw_catalogs()
     show_selected_models()
     show_quota()
+    show_token_balance()
     show_measured_performance()
     show_task_routing()
     print("\n" + "=" * 72)
-    print("Done. Section 5 is the actual decision -- which provider+model handles")
+    print("Done. Section 6 is the actual decision -- which provider+model handles")
     print("each task type right now, in priority order.")
     print("=" * 72)

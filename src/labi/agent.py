@@ -737,7 +737,18 @@ def build_registry():
     # ahead of that date -- discovered live now (see pick_gemini_model).
     # context_window: every model in PREFERRED_GEMINI_MODELS (the 3.x
     # Flash family) is documented at ~1M tokens.
-    register_discovered("gemini", "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/",
+    # model_prefix is "openai" (NOT "gemini") on purpose: litellm treats
+    # a "gemini/..." model string as its own NATIVE Gemini integration,
+    # which validates against litellm's own internal model list and
+    # largely ignores the custom api_base below -- so a freshly-discovered
+    # model newer than that internal list (e.g. gemini-3.5-flash) fails
+    # with NotFoundError before our api_base is ever reached. "openai/..."
+    # makes litellm do a plain OpenAI-format passthrough to whatever
+    # api_base we give it, with no internal model-name validation --
+    # which is what we actually want, since we're pointing this at
+    # Google's own OpenAI-compatible endpoint below, not litellm's
+    # hardcoded Gemini route.
+    register_discovered("gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai/",
                          "GEMINI_API_KEY", ["answering", "validation"], 40, pick_gemini_model,
                          context_window=1000000, capability_priority={"answering": 25})
     # NVIDIA NIM removed for now -- its free access is a "hosted evaluation
