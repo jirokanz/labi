@@ -739,7 +739,7 @@ def build_registry():
     # Flash family) is documented at ~1M tokens.
     register_discovered("gemini", "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/",
                          "GEMINI_API_KEY", ["answering", "validation"], 40, pick_gemini_model,
-                         context_window=1000000)
+                         context_window=1000000, capability_priority={"answering": 25})
     # NVIDIA NIM removed for now -- its free access is a "hosted evaluation
     # endpoint" rather than a confirmed indefinite production free tier.
     # Re-add if you verify your own account's limits are workable:
