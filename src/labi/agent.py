@@ -37,6 +37,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 from labi.tools.python.security import validate_code as static_validate_code
 from labi.tools.python.limits import make_preexec_fn, enforce_output_limit
 from labi.intelligence.classifier import TaskClassifier
+from labi.intelligence.local_dispatcher import dispatch_locally
 from labi.intelligence.types import RiskLevel
 from labi.providers.adaptive_registry import (
     BaseProvider,
@@ -856,6 +857,17 @@ def main():
             continue
         if goal.lower() == "quota":
             print_quota_summary(stats_store)
+            continue
+
+        local = dispatch_locally(goal)
+        if local is not None:
+            print(_c(f"   [local:{local['handler']}] No API call needed.", "cyan"))
+            print(local["result"])
+            task_id = f"task_{uuid.uuid4().hex[:8]}"
+            memory_db.save_task(task_id=task_id, goal=goal, plan=None, code=None,
+                                 answer=local["result"], provider=f"local:{local['handler']}",
+                                 workspace_path=None, success=True, cost_usd=0.0)
+            session.add(goal, "answer", local["result"])
             continue
 
         task_id = f"task_{uuid.uuid4().hex[:8]}"

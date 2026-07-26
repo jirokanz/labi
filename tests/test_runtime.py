@@ -641,3 +641,93 @@ def test_registry_prefers_provider_with_more_quota_remaining(tmp_path):
     db.record_daily_usage("groq", tokens=1, requests=950)  # 95% of its known 1000/day cap
     best = registry.get_best("coding", stats_store=db)
     assert best.name == "openrouter"
+
+
+# ---- Local-first dispatcher (no API call needed) ----
+
+def test_try_math_expression_basic_arithmetic():
+    from labi.intelligence.local_dispatcher import try_math_expression
+    assert try_math_expression("2+2") == "4"
+    assert try_math_expression("123 * 55") == "6765"
+    assert try_math_expression("10 / 4") == "2.5"
+
+
+def test_try_math_expression_handles_natural_language_wrapper():
+    from labi.intelligence.local_dispatcher import try_math_expression
+    assert try_math_expression("what is 123 * 55?") == "6765"
+    assert try_math_expression("calculate 2+2") == "4"
+    assert try_math_expression("what's 10 / 2") == "5"
+
+
+def test_try_math_expression_handles_multiplication_symbol():
+    from labi.intelligence.local_dispatcher import try_math_expression
+    assert try_math_expression("123\u00d755") == "6765"
+
+
+def test_try_math_expression_none_for_non_math_goal():
+    from labi.intelligence.local_dispatcher import try_math_expression
+    assert try_math_expression("write a script to check disk usage") is None
+    assert try_math_expression("explain kubernetes") is None
+
+
+def test_try_math_expression_none_for_math_embedded_in_unrelated_text():
+    # Deliberately conservative -- a math expression embedded in a longer
+    # sentence should NOT be extracted and answered locally (precision
+    # over recall, since there's no review step on a local answer).
+    from labi.intelligence.local_dispatcher import try_math_expression
+    assert try_math_expression("I have 3 cats and 2 dogs, what is 2+2 anyway") is None
+
+
+def test_try_math_expression_rejects_unsafe_input():
+    from labi.intelligence.local_dispatcher import try_math_expression
+    assert try_math_expression("__import__('os').system('ls')") is None
+    assert try_math_expression("open('/etc/passwd').read()") is None
+    assert try_math_expression("2+2; import os") is None
+
+
+def test_try_math_expression_rejects_absurd_exponent():
+    from labi.intelligence.local_dispatcher import try_math_expression
+    assert try_math_expression("2 ** 99999") is None  # would hang/blow memory otherwise
+
+
+def test_try_uuid_request_detects_and_generates():
+    from labi.intelligence.local_dispatcher import try_uuid_request
+    import uuid as uuid_module
+    result = try_uuid_request("generate a uuid for me")
+    assert result is not None
+    uuid_module.UUID(result)  # raises if not a valid UUID string
+
+
+def test_try_uuid_request_none_for_unrelated_goal():
+    from labi.intelligence.local_dispatcher import try_uuid_request
+    assert try_uuid_request("write a script to check disk usage") is None
+
+
+def test_try_timestamp_request_unix():
+    from labi.intelligence.local_dispatcher import try_timestamp_request
+    import time
+    result = try_timestamp_request("give me the unix timestamp")
+    assert result is not None
+    assert abs(int(result) - int(time.time())) < 5
+
+
+def test_try_timestamp_request_iso_current_time():
+    from labi.intelligence.local_dispatcher import try_timestamp_request
+    result = try_timestamp_request("what time is it")
+    assert "T" in result  # ISO 8601 format marker
+
+
+def test_try_timestamp_request_none_for_unrelated_goal():
+    from labi.intelligence.local_dispatcher import try_timestamp_request
+    assert try_timestamp_request("write a script to check disk usage") is None
+
+
+def test_dispatch_locally_composes_checks_in_order():
+    from labi.intelligence.local_dispatcher import dispatch_locally
+    result = dispatch_locally("2+2")
+    assert result == {"handler": "math", "result": "4"}
+
+
+def test_dispatch_locally_returns_none_when_nothing_matches():
+    from labi.intelligence.local_dispatcher import dispatch_locally
+    assert dispatch_locally("write a Telegram bot") is None
