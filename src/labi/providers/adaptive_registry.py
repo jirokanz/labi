@@ -246,6 +246,19 @@ PREFERRED_GEMINI_MODELS = [
     "gemini-3.5-flash", "gemini-3.1-flash", "gemini-3-flash", "flash",
 ]
 PREFERRED_OPENROUTER_MODELS = [
+    # Confirmed live 07/26/2026: OpenRouter's free catalog has moved
+    # away from Llama entirely (same shift Cerebras made earlier) --
+    # llama-3.3-70b-instruct:free no longer exists there, which meant
+    # this list fell through to picking whatever was listed first
+    # (an obscure small model) rather than a deliberate choice. Ranked
+    # by recognizable lab + larger parameter count, since we don't have
+    # hard quality benchmarks across these to rank on: OpenAI's
+    # gpt-oss family, then Nvidia's larger Nemotron variants, then
+    # Google's Gemma, with "llama" kept last in case Llama free models
+    # return later.
+    "gpt-oss-120b", "gpt-oss-20b",
+    "nemotron-3-ultra", "nemotron-3-super",
+    "gemma-4-31b", "gemma-4",
     "llama-3.3-70b-instruct", "llama-3.1-70b-instruct", "llama",
 ]
 
