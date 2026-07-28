@@ -31,6 +31,12 @@ class TaskProfile:
     recommended_strategy: RecommendedStrategy
     estimated_tokens: int
     keywords: List[str] = field(default_factory=list)
+    # Whether this goal needs a real web_search() rather than a model
+    # answering from its own (frozen) knowledge, and how confident that
+    # call is. Defaulted so every existing TaskProfile(...) call site
+    # (this repo's and any external one) keeps working unchanged.
+    requires_web: bool = False
+    web_confidence: float = 0.0
 
 @dataclass
 class ReuseDecision:

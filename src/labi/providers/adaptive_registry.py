@@ -97,6 +97,23 @@ class BaseProvider:
 class AdaptiveProviderRegistry:
     MIN_SAMPLES = 4          # below this, trust the static priority (cold start)
     LATENCY_PENALTY_PER_SEC = 5  # score points lost per second of avg latency
+    # Score points lost per $ of avg cost per call, keyed by capability --
+    # a flat weight across all capabilities would treat a $0.01 penalty on
+    # "coding" (where a wrong answer costs an autofix retry loop, so quality
+    # should dominate) the same as on "answering" (where a merely-good-enough
+    # free answer is fine). Lower weight = cost matters less = quality-
+    # sensitive capability; higher weight = cost matters more.
+    COST_WEIGHTS = {
+        "coding": 300,
+        "planning": 500,
+        "answering": 1000,
+        "validation": 800,
+    }
+    DEFAULT_COST_WEIGHT = 500  # for capabilities not listed above (e.g. web_search)
+    # All providers currently in build_registry() are free-tier, so this
+    # stays a no-op today (avg_cost_usd == 0) -- it only bites once a paid
+    # provider (e.g. the commented-out DeepSeek) is registered alongside
+    # free ones, so cost is weighed instead of ignored.
     QUOTA_DAMPEN_FLOOR = 0.05  # never fully zero out a provider on quota alone --
                                 # our tracked usage can undercount real usage
                                 # (same key used outside this app), and a daily
@@ -127,12 +144,12 @@ class AdaptiveProviderRegistry:
         return max(self.QUOTA_DAMPEN_FLOOR, 1.0 - pct)
 
     def _score(self, provider, capability, stats_store):
-        """Higher is better. Blends measured success rate + latency with the
-        static priority as a prior, so a provider with few/no data points
+        """Higher is better. Blends measured success rate + latency + cost with
+        the static priority as a prior, so a provider with few/no data points
         still ranks the same as the old hardcoded-priority behavior. Quota
         headroom then dampens whichever base score, applied uniformly so a
         provider nearing its daily cap gets deprioritized regardless of how
-        good its priority/success/latency numbers look in isolation."""
+        good its priority/success/latency/cost numbers look in isolation."""
         static_score = 1000 - provider.priority_for(capability)  # invert: lower priority number = higher score
         if stats_store is None:
             base = static_score
@@ -143,8 +160,13 @@ class AdaptiveProviderRegistry:
             else:
                 success_rate = stats["successes"] / stats["calls"]
                 avg_latency_s = stats["total_latency_ms"] / stats["calls"] / 1000
-                # success rate dominates (0-100 range), latency is a tie-breaking penalty
-                base = (success_rate * 100) - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC)
+                avg_cost_usd = stats["total_cost_usd"] / stats["calls"]
+                cost_weight = self.COST_WEIGHTS.get(capability, self.DEFAULT_COST_WEIGHT)
+                # success rate dominates (0-100 range); latency and cost are
+                # both tie-breaking penalties on top of it.
+                base = (success_rate * 100) \
+                    - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC) \
+                    - (avg_cost_usd * cost_weight)
         return base * self._quota_factor(provider, stats_store)
 
     def _fits(self, provider, min_context):

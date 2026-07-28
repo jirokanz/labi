@@ -52,6 +52,8 @@ from labi.providers.adaptive_registry import (
 )
 from labi.providers.stats import ProviderStatsStore
 from labi.providers.cost import CostTracker
+from labi.tools import web as web_search
+from labi.tools.sources import SourceStore
 
 load_dotenv()
 
@@ -65,6 +67,7 @@ _LABI_STATE_DIR = Path.home() / "labi" / "state"
 _LABI_STATE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("LABI_DB_PATH", str(_LABI_STATE_DIR / "memory.db"))
 STATS_DB_PATH = os.getenv("LABI_STATS_DB_PATH", str(_LABI_STATE_DIR / "provider_stats.db"))
+SOURCES_DB_PATH = os.getenv("LABI_SOURCES_DB_PATH", str(_LABI_STATE_DIR / "sources.db"))
 WORKSPACE_ROOT = Path.home() / "labi" / "workspace"
 MAX_FIX_ATTEMPTS = 3
 EXECUTION_TIMEOUT = 20
@@ -729,8 +732,13 @@ def build_registry():
     # Groq's 10.
     # context_window intentionally left unset (None) -- which specific
     # free model OpenRouter serves varies too much to guess a safe number.
+    # web_search is added to OpenRouter and Gemini (not Groq, which is
+    # pinned to planning/coding above) so a dedicated web_search-quality
+    # provider isn't required for this capability to resolve -- it just
+    # reuses the same general-purpose "answering" models to summarize
+    # search results, same as the plain answering path.
     register_discovered("openrouter", "openrouter", "https://openrouter.ai/api/v1",
-                         "OPENROUTER_API_KEY", ["answering", "planning", "coding", "validation"], 30,
+                         "OPENROUTER_API_KEY", ["answering", "planning", "coding", "validation", "web_search"], 30,
                          pick_openrouter_model, capability_priority={"validation": 45})
     # Gemini: gemini-2.5-flash (the old hardcoded model) is deprecated,
     # shutdown 10/16/2026, and some accounts report it already failing
@@ -749,7 +757,7 @@ def build_registry():
     # Google's own OpenAI-compatible endpoint below, not litellm's
     # hardcoded Gemini route.
     register_discovered("gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai/",
-                         "GEMINI_API_KEY", ["answering", "validation"], 40, pick_gemini_model,
+                         "GEMINI_API_KEY", ["answering", "validation", "web_search"], 40, pick_gemini_model,
                          context_window=1000000, capability_priority={"answering": 25})
     # NVIDIA NIM removed for now -- its free access is a "hosted evaluation
     # endpoint" rather than a confirmed indefinite production free tier.
@@ -817,6 +825,84 @@ CONTINUATION_PREFIXES = [
 ]
 
 
+def needs_live_info(goal, classifier=None):
+    """Delegates to TaskClassifier.classify()'s requires_web signal
+    instead of a standalone keyword list. That signal covers two
+    families: goals that name their own time-sensitivity directly
+    ("latest", "current", "today"...), plus "who is the <role>"
+    role-holder questions (e.g. "who is the CEO of OpenAI?"), which have
+    no freshness keyword at all but are just as time-sensitive -- asking
+    about a role implicitly means "whoever holds it now". See
+    classifier.py's _detect_requires_web for the confidence scoring."""
+    classifier = classifier or TaskClassifier()
+    return classifier.classify(goal).requires_web
+
+
+def try_web_search_answer(goal, task_id, registry, stats_store, source_store, memory_db, workspace, session):
+    """The observe -> summarize half of the agent loop: search the web,
+    then have a provider answer using only those results with inline
+    citations. Returns True if it produced and saved an answer (caller
+    should treat the goal as handled this turn), False if search or
+    summarization couldn't happen for any reason (caller should fall
+    back to the normal plan/code/answer pipeline instead)."""
+    print(_c("   [web_search] Looking this up...", "cyan"))
+    results = web_search.search(goal)
+    if results is None:
+        reason = web_search.LAST_ERROR.get("search", "unavailable")
+        print(_c(f"   Web search unavailable ({reason}) -- "
+                  f"answering from the model's own knowledge instead.", "yellow"))
+        return False
+    if not results:
+        print(_c("   No web results found -- answering from the model's own knowledge instead.", "yellow"))
+        return False
+
+    candidates = registry.get_all("web_search", stats_store=stats_store)
+    if not candidates:
+        print("No provider configured for web_search -- answering from the model's own knowledge instead.")
+        return False
+
+    sources_context = "\n\n".join(
+        f"[{i + 1}] {r['title']} ({r['url']})\n{r['snippet']}"
+        for i, r in enumerate(results)
+    )
+    prompt = (
+        f"Using ONLY the sources below, answer this question: {goal}\n\n"
+        f"Sources:\n{sources_context}\n\n"
+        "Cite sources inline as [1], [2], etc. If the sources don't actually "
+        "answer the question, say so rather than guessing."
+    )
+
+    cost_tracker = CostTracker()
+    for provider in candidates:
+        try:
+            answer = stream_generate(
+                provider, prompt,
+                system_prompt="You are a research assistant. Be concise and cite sources inline.",
+                max_tokens=512, label="Reading sources",
+                stats_store=stats_store, capability="web_search", cost_tracker=cost_tracker,
+            )
+        except Exception as e:
+            print(f"Provider {provider.name} failed: {e}")
+            continue
+
+        memory_db.save_task(task_id=task_id, goal=goal, plan=None, code=None,
+                             answer=answer, provider=provider.name,
+                             workspace_path=str(workspace.create_workspace(task_id)),
+                             success=True, cost_usd=cost_tracker.total)
+        for r in results:
+            source_store.record(task_id, r["url"], r["title"], r["snippet"])
+        session.add(goal, "answer", answer)
+        if cost_tracker.total > 0:
+            print(_c(f"   (cost: ${cost_tracker.total:.6f})", "grey"))
+        print(_c("\nSources:", "grey"))
+        for i, r in enumerate(results, 1):
+            print(_c(f"  [{i}] {r['title']} -- {r['url']}", "grey"))
+        return True
+
+    print("All web_search providers failed -- answering from the model's own knowledge instead.")
+    return False
+
+
 def is_question_or_followup(goal, session):
     question_keywords = ["what", "how", "why", "when", "where", "who", "is", "are",
                           "can", "do", "does", "will", "would", "could", "should"]
@@ -844,6 +930,7 @@ def main():
 
     memory_db = MemoryDB(DB_PATH)
     stats_store = ProviderStatsStore(STATS_DB_PATH)
+    source_store = SourceStore(SOURCES_DB_PATH)
     workspace = WorkspaceManager()
     router = MemoryRouter(memory_db)
     replay_manager = ReplayManager(memory_db, workspace)
@@ -882,6 +969,16 @@ def main():
             continue
 
         task_id = f"task_{uuid.uuid4().hex[:8]}"
+
+        if needs_live_info(goal):
+            handled = try_web_search_answer(
+                goal, task_id, registry, stats_store, source_store, memory_db, workspace, session)
+            if handled:
+                continue
+            # No key configured / no results / all summarizer providers
+            # failed -- fall through to the normal pipeline below so the
+            # model still attempts an answer from its own knowledge
+            # rather than the goal going completely unhandled.
 
         decision = router.route(goal)
         if decision["decision"] == "reuse" and decision["candidate"]:

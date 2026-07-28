@@ -1,4 +1,6 @@
-"""TaskClassifier - Heuristic-based, zero-LLM cost.""" 
+"""TaskClassifier - Heuristic-based, zero-LLM cost."""
+
+import re
 
 from labi.intelligence.types import TaskProfile, TaskCategory, RiskLevel, RecommendedStrategy
 
@@ -25,8 +27,42 @@ class TaskClassifier:
         "planner": ["plan", "design", "architecture", "strategy", "approach"],
     }
 
+    # Signal family 1: explicit freshness keywords -- a goal that names
+    # its own time-sensitivity ("latest", "current", "today"...).
+    LIVE_INFO_KEYWORDS = [
+        "latest", "current", "currently", "today", "right now", "as of",
+        "recent", "recently", "this week", "this month", "this year",
+        "news", "update", "updated", "release", "released", "price", "stock",
+        "score",
+    ]
+
+    # Signal family 2: "who is the <role>" role-holder questions. These
+    # have NO freshness keyword at all ("who is the CEO of OpenAI?") but
+    # are exactly as time-sensitive as "who is the current CEO" -- asking
+    # about a role implicitly means "whoever holds it now", which any
+    # model's frozen training data can only answer as of its cutoff. This
+    # is the gap a plain keyword list misses.
+    CURRENT_ROLE_TITLES = [
+        "ceo", "president", "prime minister", "chairman", "chairwoman",
+        "chair", "director", "chancellor", "governor", "mayor", "pope",
+        "monarch", "king", "queen", "head coach", "commissioner",
+        "secretary general", "secretary of state",
+    ]
+    CURRENT_ROLE_PATTERN = re.compile(
+        r"\bwho\s+(?:is|are)\s+(?:the\s+)?(?:current\s+|new\s+)?(" +
+        "|".join(re.escape(t) for t in CURRENT_ROLE_TITLES) + r")\b"
+    )
+    # Explicit historical framing overrides the role pattern -- "who was
+    # the first president" or "who is the historical founder" is asking
+    # about a fixed, settled fact, not the current officeholder.
+    HISTORICAL_MARKERS = [
+        "first", "original", "founder", "founding", "died", "history of",
+        "used to be", "former", "was the", "back in", "historically",
+    ]
+
     def classify(self, goal: str) -> TaskProfile:
         text = goal.lower()
+        requires_web, web_confidence = self._detect_requires_web(text)
         return TaskProfile(
             category=self._detect_category(text),
             complexity=self._compute_complexity(text),
@@ -34,8 +70,22 @@ class TaskClassifier:
             required_role=self._detect_role(text),
             recommended_strategy=self._infer_strategy(text),
             estimated_tokens=int(len(text.split()) * 1.5) + 100,
-            keywords=[kw for kw in self.COMPLEXITY_KEYWORDS if kw in text]
+            keywords=[kw for kw in self.COMPLEXITY_KEYWORDS if kw in text],
+            requires_web=requires_web,
+            web_confidence=web_confidence,
         )
+
+    def _detect_requires_web(self, text: str):
+        """Returns (requires_web, confidence). The keyword match is the
+        stronger signal (the goal names its own time-sensitivity
+        directly); the role-holder pattern is a bit weaker since it's
+        inferred rather than stated, and is suppressed entirely by an
+        explicit historical marker."""
+        if any(kw in text for kw in self.LIVE_INFO_KEYWORDS):
+            return True, 0.9
+        if self.CURRENT_ROLE_PATTERN.search(text) and not any(m in text for m in self.HISTORICAL_MARKERS):
+            return True, 0.75
+        return False, 0.0
 
     def _compute_complexity(self, text: str) -> float:
         score = sum(w for kw, w in self.COMPLEXITY_KEYWORDS.items() if kw in text)

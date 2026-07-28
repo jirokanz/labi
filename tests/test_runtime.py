@@ -731,3 +731,50 @@ def test_dispatch_locally_composes_checks_in_order():
 def test_dispatch_locally_returns_none_when_nothing_matches():
     from labi.intelligence.local_dispatcher import dispatch_locally
     assert dispatch_locally("write a Telegram bot") is None
+
+
+# ---- web_search trigger heuristic ----
+
+def test_needs_live_info_true_for_freshness_keywords():
+    from labi.agent import needs_live_info
+    assert needs_live_info("what is the latest Groq model?") is True
+    assert needs_live_info("what's the current price of bitcoin") is True
+    assert needs_live_info("any news on the election today") is True
+
+
+def test_needs_live_info_false_for_timeless_questions():
+    from labi.agent import needs_live_info
+    assert needs_live_info("what is the capital of France?") is False
+    assert needs_live_info("write a script to check disk usage") is False
+    assert needs_live_info("explain how a hash table works") is False
+
+
+def test_needs_live_info_catches_role_holder_questions_without_freshness_keywords():
+    """The exact blind spot the plain keyword list missed: no 'latest'/
+    'current'/'today' anywhere, but asking about a role implicitly means
+    'whoever holds it now'."""
+    from labi.agent import needs_live_info
+    assert needs_live_info("who is the CEO of OpenAI?") is True
+    assert needs_live_info("who is the prime minister of Japan") is True
+    assert needs_live_info("who is the president of Harvard?") is True
+
+
+def test_needs_live_info_false_for_explicitly_historical_role_questions():
+    from labi.agent import needs_live_info
+    assert needs_live_info("who was the first president of the United States?") is False
+    assert needs_live_info("who was the founding CEO of the company?") is False
+
+
+def test_needs_live_info_false_for_named_historical_figures():
+    from labi.agent import needs_live_info
+    assert needs_live_info("who is Napoleon Bonaparte?") is False
+
+
+def test_classifier_web_confidence_scores_keyword_signal_higher_than_role_signal():
+    from labi.intelligence.classifier import TaskClassifier
+    classifier = TaskClassifier()
+    keyword_profile = classifier.classify("what is the latest Groq model?")
+    role_profile = classifier.classify("who is the CEO of OpenAI?")
+    assert keyword_profile.requires_web is True
+    assert role_profile.requires_web is True
+    assert keyword_profile.web_confidence > role_profile.web_confidence
