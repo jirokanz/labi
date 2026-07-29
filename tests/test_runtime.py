@@ -483,53 +483,13 @@ def test_compute_quota_status_over_limit_clamps_at_zero_remaining():
 
 
 # ---- Validator step (Phase C.5) ----
-
-class _FakeValidatorProvider:
-    """Minimal stand-in for BaseProvider -- just enough surface for
-    stream_generate to call generate_stream/generate without hitting a
-    real API."""
-    def __init__(self, name, verdict):
-        self.name = name
-        self._verdict = verdict
-
-    def generate_stream(self, prompt, system_prompt=None, max_tokens=768, history=None):
-        yield self._verdict
-
-    def generate(self, prompt, system_prompt=None, max_tokens=768, history=None):
-        return {"content": self._verdict}
-
-
-class _FakeRegistry:
-    def __init__(self, provider):
-        self._provider = provider
-
-    def get_best(self, capability, stats_store=None, min_context=None):
-        return self._provider
-
-
-def test_validate_result_pass():
-    from labi.agent import validate_result, CostTracker
-    registry = _FakeRegistry(_FakeValidatorProvider("gemini", "PASS"))
-    passed, reason, ran = validate_result("reverse a string", "code", "output", registry, None, CostTracker())
-    assert passed is True
-    assert ran is True
-
-
-def test_validate_result_fail():
-    from labi.agent import validate_result, CostTracker
-    registry = _FakeRegistry(_FakeValidatorProvider("gemini", "FAIL: output is empty"))
-    passed, reason, ran = validate_result("reverse a string", "code", "output", registry, None, CostTracker())
-    assert passed is False
-    assert "empty" in reason
-    assert ran is True
-
-
-def test_validate_result_no_validator_available_is_unverified_not_failed():
-    from labi.agent import validate_result, CostTracker
-    registry = _FakeRegistry(None)  # no provider registered for "validation"
-    passed, reason, ran = validate_result("reverse a string", "code", "output", registry, None, CostTracker())
-    assert passed is True  # unverified should not block completion
-    assert ran is False
+# validate_result() was removed from agent.py -- its goal-vs-output check
+# logic now lives in agents/validator.py's ValidatorAgent, and these three
+# scenarios (PASS, FAIL with reason, no-validator-available-is-unverified)
+# are covered there instead: see tests/agents/test_validator.py's
+# test_process_marks_completed_on_pass,
+# test_process_marks_failed_status_coding_on_fail_with_reason, and
+# test_process_degrades_to_unverified_pass_when_no_provider_available.
 
 
 # ---- Richer model metadata: context_window + min_context filtering ----

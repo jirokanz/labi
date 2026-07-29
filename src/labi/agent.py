@@ -10,9 +10,7 @@ import difflib
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -34,11 +32,8 @@ litellm.set_verbose = False
 import logging
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-from labi.tools.python.security import validate_code as static_validate_code
-from labi.tools.python.limits import make_preexec_fn, enforce_output_limit
 from labi.intelligence.classifier import TaskClassifier
 from labi.intelligence.local_dispatcher import dispatch_locally
-from labi.intelligence.types import RiskLevel
 from labi.providers.adaptive_registry import (
     BaseProvider,
     AdaptiveProviderRegistry as ProviderRegistry,
@@ -51,6 +46,14 @@ from labi.providers.adaptive_registry import (
     LAST_DISCOVERY_ERROR,
 )
 from labi.providers.stats import ProviderStatsStore
+from labi.core.task import Task
+from labi.context.manager import ContextManager
+from labi.context.prompt_builder import PromptBuilder
+from labi.context.artifact import ArtifactStore
+from labi.agents.planner import PlannerAgent
+from labi.agents.executor import ExecutorAgent
+from labi.agents.validator import ValidatorAgent
+from labi.workflows.software_dev import SoftwareDevelopmentWorkflow
 from labi.providers.cost import CostTracker
 from labi.tools import web as web_search
 from labi.tools.sources import SourceStore
@@ -74,71 +77,15 @@ EXECUTION_TIMEOUT = 20
 MAX_OUTPUT_BYTES = 1_048_576
 
 # ---------- Terminal formatting ----------
-from labi.providers.generation import _c, stream_generate  # noqa: E402  (see providers/generation.py docstring)
-
-_PY_KEYWORDS = {
-    "def", "class", "return", "if", "elif", "else", "for", "while", "in",
-    "import", "from", "as", "with", "try", "except", "finally", "raise",
-    "pass", "break", "continue", "yield", "lambda", "None", "True", "False",
-    "and", "or", "not", "is", "global", "nonlocal", "assert", "async", "await",
-}
-
-
-_STRING_RE = re.compile(r"""('[^'\\]*(?:\\.[^'\\]*)*'|"[^"\\]*(?:\\.[^"\\]*)*")""")
-
-
-def _highlight_line(line):
-    if not _USE_COLOR:
-        return line
-    stripped = line.strip()
-    if stripped.startswith("#"):
-        return _c(line, "grey")
-
-    # Pull out string literals first so the word-splitter below doesn't
-    # tear them apart before a color can be applied.
-    parts = _STRING_RE.split(line)
-    out = []
-    for i, part in enumerate(parts):
-        if i % 2 == 1:  # captured string literal
-            out.append(_c(part, "green"))
-            continue
-        for tok in re.split(r"(\W+)", part):
-            out.append(_c(tok, "magenta") if tok in _PY_KEYWORDS else tok)
-    return "".join(out)
-
-
-def format_code_block(code, title="code"):
-    """Boxed, line-numbered, lightly syntax-highlighted code display --
-    replaces the old bare `print(code)` wall of text."""
-    lines = code.splitlines() or [""]
-    width = max((len(l) for l in lines), default=0)
-    width = min(max(width, len(title)), 100)
-    bar = "─" * (width + 6)
-    out = [f"\n{_c('┌' + bar + '┐', 'dim')}", f"{_c('│', 'dim')} {_c(title, 'bold')}"]
-    out.append(_c("├" + bar + "┤", "dim"))
-    gutter_width = len(str(len(lines)))
-    for i, line in enumerate(lines, 1):
-        num = str(i).rjust(gutter_width)
-        out.append(f"{_c(num, 'grey')} {_c('│', 'dim')} {_highlight_line(line)}")
-    out.append(_c("└" + bar + "┘", "dim"))
-    return "\n".join(out)
+from labi.providers.generation import (  # noqa: E402  (see providers/generation.py docstring)
+    _c, stream_generate, format_code_block, _highlight_line, _PY_KEYWORDS, _STRING_RE,
+)
 
 
 # ---------- Code extraction ----------
-def estimate_tokens(text):
-    """Rough chars/4 estimate -- deliberately not calling litellm.token_counter
-    here (that's a heavier, model-specific call). This only needs to be
-    right enough to skip a provider whose context window is clearly too
-    small, not exact."""
-    return len(text) // 4
+from labi.providers.generation import estimate_tokens  # noqa: E402  (see providers/generation.py docstring)
 
-
-def extract_code(text):
-    match = re.search(r"```(?:python)?\n(.*?)\n```", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
-
+from labi.tools.python.sandbox import extract_code, execute_code  # noqa: E402  (see tools/python/sandbox.py docstring)
 
 
 # ---------- Memory ----------
@@ -289,231 +236,7 @@ class MemoryRouter:
 
 
 # ---------- Sandboxed execution ----------
-def execute_code(code, timeout=EXECUTION_TIMEOUT):
-    """Run generated code with: static validation, a subprocess boundary,
-    and (on POSIX) CPU/memory rlimits. This was previously a bare
-    subprocess.run with no checks at all."""
-    code = extract_code(code)
-
-    violations = static_validate_code(code)
-    if violations:
-        return "", "Blocked before execution:\n- " + "\n- ".join(violations), -2
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        f.write(code)
-        fname = f.name
-    try:
-        result = subprocess.run(
-            [sys.executable, fname],
-            capture_output=True, text=True, timeout=timeout,
-            preexec_fn=make_preexec_fn(cpu_seconds=timeout, memory_mb=256),
-        )
-        stdout, stderr, exit_code = result.stdout, result.stderr, result.returncode
-    except subprocess.TimeoutExpired:
-        stdout, stderr, exit_code = "", "Execution timed out", -1
-    finally:
-        os.unlink(fname)
-
-    stdout = enforce_output_limit(stdout, MAX_OUTPUT_BYTES)
-    stderr = enforce_output_limit(stderr, MAX_OUTPUT_BYTES)
-    return stdout, stderr, exit_code
-
-
-def show_diff(old_code, new_code):
-    if not old_code:
-        return
-    diff = list(difflib.unified_diff(
-        old_code.splitlines(), new_code.splitlines(),
-        lineterm="", fromfile="previous", tofile="updated",
-    ))
-    if not diff:
-        print("   (no changes)")
-        return
-    for line in diff[:60]:
-        if line.startswith("+") and not line.startswith("+++"):
-            print(f"\033[32m{line}\033[0m")
-        elif line.startswith("-") and not line.startswith("---"):
-            print(f"\033[31m{line}\033[0m")
-        else:
-            print(line)
-
-
-
-def ask_action(prompt="What next?", options=("r", "e", "f", "s")):
-    labels = {
-        "r": "[r]un this code",
-        "e": "[e]dit it yourself in $EDITOR-style inline paste",
-        "f": "[f]eedback -- describe what to change and I'll regenerate",
-        "s": "[s]kip this task",
-    }
-    print(prompt)
-    for o in options:
-        print(f"  {labels[o]}")
-    while True:
-        choice = input("> ").strip().lower()
-        if choice in options:
-            return choice
-        print(f"Please choose one of: {', '.join(options)}")
-
-
-def validate_result(goal, code, stdout, registry, stats_store, cost_tracker):
-    """The Validator stage: exit_code == 0 only proves the code didn't
-    crash, not that it did what was asked. This runs a second, independent
-    LLM pass (the 'validation' capability -- Gemini primary, OpenRouter
-    fallback) that actually checks the output against the goal.
-
-    Returns (passed: bool, reason: str, ran: bool) -- ran=False means no
-    validation provider was available, so the caller should treat this as
-    'unverified' rather than 'failed'."""
-    validator = registry.get_best("validation", stats_store=stats_store)
-    if not validator:
-        return True, "No validation provider available -- unverified.", False
-
-    check_prompt = (
-        f"Goal: {goal}\n\n"
-        f"Code that was run:\n{code}\n\n"
-        f"Output produced:\n{stdout[:1500]}\n\n"
-        "Does this output actually accomplish the stated goal? This is a real "
-        "check, not a rubber stamp -- look for wrong values, missing parts of "
-        "the request, or output that runs without error but doesn't answer "
-        "what was asked.\n"
-        "Respond with exactly one line: 'PASS' or 'FAIL: <one-sentence reason>'."
-    )
-    try:
-        raw = stream_generate(
-            validator, check_prompt, max_tokens=100, label="Validating", render="text",
-            stats_store=stats_store, capability="validation", cost_tracker=cost_tracker,
-        )
-    except Exception as e:
-        return True, f"Validator call failed ({e}) -- unverified.", False
-
-    verdict = raw.strip()
-    if verdict.upper().startswith("PASS"):
-        return True, "Validator confirmed the output matches the goal.", True
-    return False, verdict, True
-
-
-def run_with_autofix_interactive(goal, plan, coder, workspace, registry, stats_store, task_id, cost_tracker):
-    """Interactive plan->code->review loop. Unlike the old one-shot
-    generate-and-run, this shows you the code before executing and lets
-    you approve, hand-edit, or give free-text feedback to regenerate --
-    the conversation history is kept so feedback compounds."""
-    history = []
-    code = None
-    provider = None
-    ws_path = workspace.root / f"task_{task_id}"
-
-    risk_profile = TaskClassifier().classify(goal)
-    if risk_profile.risk != RiskLevel.LOW:
-        kw = ", ".join(risk_profile.keywords) if risk_profile.keywords else "goal wording"
-        print(_c(f"   Risk assessment: {risk_profile.risk.value.upper()} (flagged on: {kw})", "yellow"))
-
-    gen_prompt = f"Write Python code for this goal:\nGoal: {goal}\nPlan: {plan}\n\nOutput only the code, no explanation."
-    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code", stats_store=stats_store, capability="coding", cost_tracker=cost_tracker)
-    code = extract_code(raw)
-    provider = coder.name
-    history.append({"role": "user", "content": gen_prompt})
-    history.append({"role": "assistant", "content": raw})
-
-    while True:
-        print(format_code_block(code, title=f"{goal[:60]}"))
-
-        action = ask_action()
-
-        if action == "e":
-            print("Paste replacement code, then a line with just EOF:")
-            lines = []
-            while True:
-                line = input()
-                if line.strip() == "EOF":
-                    break
-                lines.append(line)
-            new_code = "\n".join(lines)
-            print("\nDiff vs. previous version:")
-            show_diff(code, new_code)
-            code = new_code
-            continue
-
-        if action == "f":
-            feedback = input("What should change? ").strip()
-            fix_prompt = f"The current code for goal '{goal}' needs this change:\n{feedback}\n\nCurrent code:\n{code}\n\nOutput only the corrected full code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code", stats_store=stats_store, capability="coding", cost_tracker=cost_tracker)
-            new_code = extract_code(raw)
-            print("Diff vs. previous version:")
-            show_diff(code, new_code)
-            history.append({"role": "user", "content": fix_prompt})
-            history.append({"role": "assistant", "content": raw})
-            code = new_code
-            continue
-
-        if action == "s":
-            return None, None, None, None
-
-        if risk_profile.risk == RiskLevel.HIGH:
-            confirm = input(_c(
-                f"   This goal was flagged HIGH RISK. Type 'yes' to run it anyway, anything else to go back: ",
-                "yellow")).strip().lower()
-            if confirm != "yes":
-                print("   Not running. Back to review.")
-                continue
-
-        # action == "r": run it, with auto-fix on failure
-        for attempt in range(MAX_FIX_ATTEMPTS):
-            workspace.save_code(ws_path, code)
-            print("Executing (sandboxed)...")
-            stdout, stderr, exit_code = execute_code(code)
-            workspace.save_execution(ws_path, stdout, stderr, exit_code)
-
-            if exit_code == 0:
-                print(_c("Execution succeeded.", "green"))
-                if stdout:
-                    print(f"Output:\n{stdout}")
-
-                passed, reason, validator_ran = validate_result(goal, code, stdout, registry, stats_store, cost_tracker)
-                if validator_ran:
-                    if passed:
-                        print(_c(f"Validator: PASS -- {reason}", "green"))
-                    else:
-                        print(_c(f"Validator: FAIL -- {reason}", "red"))
-                else:
-                    print(_c(f"Validator: {reason}", "grey"))
-
-                if passed or attempt == MAX_FIX_ATTEMPTS - 1:
-                    return code, stdout, stderr, provider
-
-                # Validator caught something exit_code==0 couldn't --
-                # treat it like an execution failure and try again,
-                # same as the exit_code != 0 branch below.
-                fix_prompt = (f"The Python code for goal '{goal}' ran without crashing, but a "
-                              f"reviewer found this problem: {reason}\n\nCurrent code:\n{code}\n\n"
-                              "Output only the corrected code.")
-                raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history,
-                                       label=f"Auto-fixing after failed validation (attempt {attempt + 1})",
-                                       render="code", stats_store=stats_store, capability="coding",
-                                       cost_tracker=cost_tracker)
-                new_code = extract_code(raw)
-                show_diff(code, new_code)
-                history.append({"role": "user", "content": fix_prompt})
-                history.append({"role": "assistant", "content": raw})
-                code = new_code
-                continue
-
-            print(_c(f"Execution failed (exit code {exit_code}).", "red"))
-            if stderr:
-                print(f"Error: {stderr[:300]}")
-            if attempt == MAX_FIX_ATTEMPTS - 1:
-                break
-
-            fix_prompt = f"The Python code for goal '{goal}' failed:\n\n{stderr}\n\nCurrent code:\n{code}\n\nOutput only the corrected code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code", stats_store=stats_store, capability="coding", cost_tracker=cost_tracker)
-            new_code = extract_code(raw)
-            show_diff(code, new_code)
-            history.append({"role": "user", "content": fix_prompt})
-            history.append({"role": "assistant", "content": raw})
-            code = new_code
-
-        print("Max fix attempts reached for this run. Back to review.")
-        # loop back to review menu instead of silently failing
+# execute_code() is imported from labi.tools.python.sandbox above.
 
 
 # ---------- Provider registry ----------
@@ -951,38 +674,50 @@ def main():
                     continue
             continue
 
-        ws_path = workspace.create_workspace(task_id)
-        context = session.as_context()
-        plan_prompt = f"{context}Create a short, clear, numbered plan for: {goal}"
-        planner = registry.get_best("planning", stats_store=stats_store,
-                                     min_context=estimate_tokens(plan_prompt) + 200)
-        coder = registry.get_best("coding", stats_store=stats_store)
-        if not planner or not coder:
-            print("No provider configured for planning/coding (or none with enough context -- try 'reset').")
-            continue
-
+        task_context_manager = ContextManager(artifact_store=ArtifactStore())
+        prompt_builder = PromptBuilder(task_context_manager.artifact_store)
         cost_tracker = CostTracker()
-        plan = stream_generate(planner, plan_prompt,
-                                max_tokens=1024, label="Planning", stats_store=stats_store, capability="planning",
-                                cost_tracker=cost_tracker)
-        workspace.save_plan(ws_path, plan)
 
-        code, stdout, stderr, provider = run_with_autofix_interactive(
-            goal, plan, coder, workspace, registry, stats_store, task_id, cost_tracker)
+        planner_agent = PlannerAgent(registry, prompt_builder, stats_store=stats_store, cost_tracker=cost_tracker)
+        executor_agent = ExecutorAgent(registry, prompt_builder, stats_store=stats_store, cost_tracker=cost_tracker)
+        validator_agent = ValidatorAgent(registry, prompt_builder, stats_store=stats_store, cost_tracker=cost_tracker)
+
+        workflow = SoftwareDevelopmentWorkflow(task_context_manager)
+        workflow.add_agent(planner_agent).add_agent(executor_agent).add_agent(validator_agent)
+
+        conv_id = task_context_manager.create_conversation()
+        task_context_manager.add_message(conv_id, "user", session.as_context())
+        task = Task(id=task_id, goal=goal, context_id=conv_id)
+        result = workflow.execute(task)
+
+        ws_path = workspace.create_workspace(task_id)
+        final_snapshot = task_context_manager.snapshot(task_id)
+        plan_text = "\n".join(final_snapshot.plan) if final_snapshot.plan else ""
+        workspace.save_plan(ws_path, plan_text)
+        artifacts = result.get("artifacts") or task_context_manager.get_task_artifacts(task_id)
+        code = artifacts[-1].content if artifacts else ""
+        provider_name = executor_agent.last_provider or "unknown"
+        if code:
+            workspace.save_code(ws_path, code)
+        if final_snapshot.execution_stdout is not None:
+            workspace.save_execution(ws_path, final_snapshot.execution_stdout or "",
+                                      final_snapshot.execution_stderr or "",
+                                      final_snapshot.execution_exit_code)
 
         if cost_tracker.total > 0:
             print(_c(f"Task cost so far: ${cost_tracker.total:.6f} across {cost_tracker.calls} calls", "grey"))
 
-        if code and stdout is not None:
+        if result["status"] == "completed":
+            stdout = final_snapshot.execution_stdout or ""
             print("\nTask completed and saved to memory.")
-            memory_db.save_task(task_id=task_id, goal=goal, plan=plan, code=code, answer=stdout,
-                                 provider=provider, workspace_path=str(ws_path), success=True,
+            memory_db.save_task(task_id=task_id, goal=goal, plan=plan_text, code=code, answer=stdout,
+                                 provider=provider_name, workspace_path=str(ws_path), success=True,
                                  cost_usd=cost_tracker.total)
             session.add(goal, "code", f"Wrote and ran code for: {goal}. Output: {stdout[:150]}")
         else:
-            print("\nTask skipped or not completed.")
-            memory_db.save_task(task_id=task_id, goal=goal, plan=plan, code=code or "",
-                                 answer=f"INCOMPLETE: {stderr or ''}", provider=provider or "unknown",
+            print(f"\nTask not completed: {result.get('error', 'unknown error')}")
+            memory_db.save_task(task_id=task_id, goal=goal, plan=plan_text, code=code,
+                                 answer=f"INCOMPLETE: {result.get('error', '')}", provider=provider_name,
                                  workspace_path=str(ws_path), success=False, cost_usd=cost_tracker.total)
 
 

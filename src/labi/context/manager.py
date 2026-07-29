@@ -25,6 +25,9 @@ class _TaskContext:
     next_step: Optional[str] = None
     previous_output: Optional[str] = None
     error: Optional[str] = None
+    execution_stdout: Optional[str] = None
+    execution_stderr: Optional[str] = None
+    execution_exit_code: Optional[int] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
@@ -42,7 +45,10 @@ class _Conversation:
 # (artifact_ids and completed are handled separately below: artifact_ids
 # don't have a _TaskContext slot, and completed drives status instead of
 # overwriting a field 1:1.)
-_UPDATABLE_FIELDS = ("plan", "current_step", "next_step", "status", "previous_output", "error")
+_UPDATABLE_FIELDS = (
+    "plan", "current_step", "next_step", "status", "previous_output", "error",
+    "execution_stdout", "execution_stderr", "execution_exit_code",
+)
 
 
 class ContextManager:
@@ -91,6 +97,9 @@ class ContextManager:
             error=task.error,
             artifacts=self.artifact_store.list_by_task(task_id),
             facts={},
+            execution_stdout=task.execution_stdout,
+            execution_stderr=task.execution_stderr,
+            execution_exit_code=task.execution_exit_code,
         )
 
     def apply_update(self, task_id: str, update: TaskUpdate) -> None:

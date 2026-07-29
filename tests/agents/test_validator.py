@@ -6,7 +6,7 @@ from labi.providers.adaptive_registry import AdaptiveProviderRegistry
 from tests.fakes import FakeProvider
 
 
-def _agent_and_snapshot(response_text, artifact_content="print('hi')"):
+def _agent_and_snapshot(response_text, stdout="hello world\n", exit_code=0, artifact_content="print('hello world')"):
     registry = AdaptiveProviderRegistry()
     registry.register(FakeProvider("validator-model", ["validation"], response_text))
     store = ArtifactStore()
@@ -14,8 +14,9 @@ def _agent_and_snapshot(response_text, artifact_content="print('hi')"):
     agent = ValidatorAgent(registry, prompt_builder)
 
     store.store_artifact("out.py", artifact_content, ArtifactType.CODE, task_id="t1")
-    snapshot = ContextSnapshot(task_id="t1", goal="goal", status="coding",
-                                artifacts=store.list_by_task("t1"))
+    snapshot = ContextSnapshot(task_id="t1", goal="print hello world", status="coding",
+                                artifacts=store.list_by_task("t1"),
+                                execution_stdout=stdout, execution_exit_code=exit_code)
     return agent, snapshot
 
 
@@ -26,18 +27,30 @@ def test_process_marks_completed_on_pass():
     assert update.status == "completed"
 
 
-def test_process_marks_failed_status_coding_when_issues_found():
-    agent, snapshot = _agent_and_snapshot("There is a bug on line 3: unhandled exception")
+def test_process_marks_failed_status_coding_on_fail_with_reason():
+    agent, snapshot = _agent_and_snapshot("FAIL: output does not print hello world", stdout="goodbye\n")
     update = agent.process(snapshot)
     assert update.completed is False
     assert update.status == "coding"
-    assert update.error is not None
+    assert "does not print hello world" in update.error
 
 
-def test_process_defaults_to_pass_when_no_problem_keywords_present():
-    agent, snapshot = _agent_and_snapshot("Looks good, follows best practices.")
+def test_process_degrades_to_unverified_pass_when_no_provider_available():
+    """Matches the old validate_result()'s 'ran=False -> unverified, not
+    failed' behavior -- missing validation infra shouldn't block a task
+    that otherwise ran successfully."""
+    registry = AdaptiveProviderRegistry()  # no validation provider registered
+    store = ArtifactStore()
+    prompt_builder = PromptBuilder(store)
+    agent = ValidatorAgent(registry, prompt_builder)
+    store.store_artifact("out.py", "print('hi')", ArtifactType.CODE, task_id="t1")
+    snapshot = ContextSnapshot(task_id="t1", goal="goal", status="coding",
+                                artifacts=store.list_by_task("t1"),
+                                execution_stdout="hi\n", execution_exit_code=0)
+
     update = agent.process(snapshot)
     assert update.completed is True
+    assert "unverified" in update.previous_output.lower()
 
 
 def test_process_returns_failed_update_with_no_artifacts():
@@ -45,15 +58,26 @@ def test_process_returns_failed_update_with_no_artifacts():
     registry.register(FakeProvider("validator-model", ["validation"], "PASS"))
     prompt_builder = PromptBuilder(ArtifactStore())
     agent = ValidatorAgent(registry, prompt_builder)
-    snapshot = ContextSnapshot(task_id="t1", goal="goal", status="coding", artifacts=[])
+    snapshot = ContextSnapshot(task_id="t1", goal="goal", status="coding", artifacts=[],
+                                execution_stdout="x", execution_exit_code=0)
 
     update = agent.process(snapshot)
     assert update.status == "failed"
     assert "artifact" in update.error.lower()
 
 
-def test_can_handle_requires_artifacts():
+def test_can_handle_requires_artifacts_and_successful_execution():
     agent, snapshot = _agent_and_snapshot("PASS")
     assert agent.can_handle(snapshot) is True
-    empty_snapshot = ContextSnapshot(task_id="t1", goal="goal", status="coding", artifacts=[])
-    assert agent.can_handle(empty_snapshot) is False
+
+    no_artifacts = ContextSnapshot(task_id="t1", goal="goal", status="coding", artifacts=[],
+                                    execution_stdout="x", execution_exit_code=0)
+    assert agent.can_handle(no_artifacts) is False
+
+    not_yet_executed = ContextSnapshot(task_id="t1", goal="goal", status="coding",
+                                        artifacts=snapshot.artifacts, execution_exit_code=None)
+    assert agent.can_handle(not_yet_executed) is False
+
+    crashed = ContextSnapshot(task_id="t1", goal="goal", status="coding",
+                               artifacts=snapshot.artifacts, execution_exit_code=1)
+    assert agent.can_handle(crashed) is False

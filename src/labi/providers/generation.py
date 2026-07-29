@@ -12,6 +12,7 @@ re-implementing provider calls, so there's exactly one place that knows
 how to talk to a provider and record what happened.
 """
 
+import re
 import sys
 import time
 
@@ -25,10 +26,65 @@ _ANSI = {
 _USE_COLOR = sys.stdout.isatty()
 
 
+def estimate_tokens(text):
+    """Rough chars/4 estimate -- deliberately not calling litellm.token_counter
+    here (that's a heavier, model-specific call). This only needs to be
+    right enough to skip a provider whose context window is clearly too
+    small, not exact."""
+    return len(text) // 4
+
+
 def _c(text, color):
     if not _USE_COLOR:
         return text
     return f"{_ANSI[color]}{text}{_ANSI['reset']}"
+
+
+_PY_KEYWORDS = {
+    "def", "class", "return", "if", "elif", "else", "for", "while", "in",
+    "import", "from", "as", "with", "try", "except", "finally", "raise",
+    "pass", "break", "continue", "yield", "lambda", "None", "True", "False",
+    "and", "or", "not", "is", "global", "nonlocal", "assert", "async", "await",
+}
+
+_STRING_RE = re.compile(r"""('[^'\\]*(?:\\.[^'\\]*)*'|"[^"\\]*(?:\\.[^"\\]*)*")""")
+
+
+def _highlight_line(line):
+    if not _USE_COLOR:
+        return line
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        return _c(line, "grey")
+
+    # Pull out string literals first so the word-splitter below doesn't
+    # tear them apart before a color can be applied.
+    parts = _STRING_RE.split(line)
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:  # captured string literal
+            out.append(_c(part, "green"))
+            continue
+        for tok in re.split(r"(\W+)", part):
+            out.append(_c(tok, "magenta") if tok in _PY_KEYWORDS else tok)
+    return "".join(out)
+
+
+def format_code_block(code, title="code"):
+    """Boxed, line-numbered, lightly syntax-highlighted code display --
+    replaces a bare `print(code)` wall of text."""
+    lines = code.splitlines() or [""]
+    width = max((len(l) for l in lines), default=0)
+    width = min(max(width, len(title)), 100)
+    bar = "─" * (width + 6)
+    out = [f"\n{_c('┌' + bar + '┐', 'dim')}", f"{_c('│', 'dim')} {_c(title, 'bold')}"]
+    out.append(_c("├" + bar + "┤", "dim"))
+    gutter_width = len(str(len(lines)))
+    for i, line in enumerate(lines, 1):
+        num = str(i).rjust(gutter_width)
+        out.append(f"{_c(num, 'grey')} {_c('│', 'dim')} {_highlight_line(line)}")
+    out.append(_c("└" + bar + "┘", "dim"))
+    return "\n".join(out)
 
 
 def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, history=None,

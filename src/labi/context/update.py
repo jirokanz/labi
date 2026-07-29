@@ -17,3 +17,6 @@ class TaskUpdate:
     error: Optional[str] = None
     artifact_ids: Optional[List[str]] = None
     completed: bool = False
+    execution_stdout: Optional[str] = None
+    execution_stderr: Optional[str] = None
+    execution_exit_code: Optional[int] = None

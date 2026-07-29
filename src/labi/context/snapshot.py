@@ -19,3 +19,10 @@ class ContextSnapshot:
     error: Optional[str] = None
     artifacts: List[Artifact] = field(default_factory=list)
     facts: Dict[str, Any] = field(default_factory=dict)
+    # Set by ExecutorAgent after a real sandboxed run (see
+    # tools/python/sandbox.py) -- ValidatorAgent uses execution_stdout to
+    # check actual output against the goal, not just review the code
+    # text. None until an execution has actually happened.
+    execution_stdout: Optional[str] = None
+    execution_stderr: Optional[str] = None
+    execution_exit_code: Optional[int] = None

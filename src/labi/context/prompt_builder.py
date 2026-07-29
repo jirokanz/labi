@@ -31,13 +31,37 @@ class PromptBuilder:
             parts.append("Full plan:\n" + "\n".join(snapshot.plan))
         if snapshot.artifacts:
             latest = snapshot.artifacts[-1]
-            parts.append(f"Previous artifact ({latest.name}):\n```\n{latest.content[:500]}\n```")
+            parts.append(f"Previous attempt ({latest.name}):\n```\n{latest.content[:500]}\n```")
+        # Feed the concrete reason the last attempt didn't work back into
+        # the prompt -- without this, a retry just regenerates blindly
+        # from the same original prompt and is likely to repeat the same
+        # mistake. execution_stderr covers a crash; snapshot.error covers
+        # either a crash summary or a validator's goal-mismatch reason
+        # (see ValidatorAgent), whichever ran last.
+        if snapshot.execution_exit_code not in (None, 0) and snapshot.execution_stderr:
+            parts.append(f"The previous attempt failed when run, with this error:\n{snapshot.execution_stderr[:500]}\n"
+                          "Fix the code so it runs without this error.")
+        elif snapshot.error:
+            parts.append(f"The previous attempt was rejected for this reason:\n{snapshot.error[:500]}\n"
+                          "Address this in the new version.")
         return "\n\n".join(parts)
 
     def build_for_validation(self, snapshot: ContextSnapshot, artifact: Artifact) -> str:
+        """Checks the code's ACTUAL output (snapshot.execution_stdout, set
+        by ExecutorAgent after a real sandboxed run) against the goal --
+        not just a static read-through of the code text, which can't
+        catch "runs fine but produces the wrong thing"."""
+        stdout_display = (snapshot.execution_stdout or "")[:1500]
         parts = [
-            "You are a validator. Review the code below for errors, edge cases, and security issues.",
-            f"Code:\n```python\n{artifact.content}\n```",
-            "Reply with exactly 'PASS' if the code is correct, or describe the issues found.",
+            f"Goal: {snapshot.goal}",
+            f"Code that was run:\n{artifact.content}",
+            f"Output produced:\n{stdout_display}",
+            "Does this output actually accomplish the stated goal? This is a real "
+            "check, not a rubber stamp -- look for wrong values, missing parts of "
+            "the request, or output that runs without error but doesn't answer "
+            "what was asked.",
+            "Respond with exactly one line: 'PASS' or 'FAIL: <one-sentence reason>'.",
         ]
+        if snapshot.execution_stderr:
+            parts.insert(3, f"Stderr when run:\n{snapshot.execution_stderr[:500]}")
         return "\n\n".join(parts)
