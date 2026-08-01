@@ -36,6 +36,16 @@ class ProviderStatsStore:
                 PRIMARY KEY (provider, day)
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS failure_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT,
+                capability TEXT,
+                reason TEXT,
+                message TEXT,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         self.conn.commit()
 
     # ---- per-capability call stats (success/latency/cost) ----
@@ -101,3 +111,41 @@ class ProviderStatsStore:
         day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cur = self.conn.execute("SELECT provider, requests, tokens FROM daily_usage WHERE day=?", (day,))
         return {r[0]: {"requests": r[1], "tokens": r[2]} for r in cur.fetchall()}
+
+    # ---- failure log (classified reasons: timeout / quota_exceeded / auth_error / not_found / api_error / other) ----
+
+    def record_failure(self, provider, capability, reason, message):
+        self.conn.execute(
+            "INSERT INTO failure_log (provider, capability, reason, message) VALUES (?, ?, ?, ?)",
+            (provider, capability, reason, (message or "")[:500]),
+        )
+        self.conn.commit()
+
+    def get_recent_failures(self, provider=None, capability=None, limit=10):
+        query = "SELECT provider, capability, reason, message, timestamp FROM failure_log"
+        conditions, params = [], []
+        if provider is not None:
+            conditions.append("provider = ?")
+            params.append(provider)
+        if capability is not None:
+            conditions.append("capability = ?")
+            params.append(capability)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        cur = self.conn.execute(query, params)
+        return [
+            {"provider": r[0], "capability": r[1], "reason": r[2], "message": r[3], "timestamp": r[4]}
+            for r in cur.fetchall()
+        ]
+
+    def get_failure_summary(self):
+        """Counts per (provider, reason), most frequent first -- 'which
+        failure type actually dominates for this provider' is a faster
+        question to answer from this than scrolling get_recent_failures."""
+        cur = self.conn.execute(
+            "SELECT provider, reason, COUNT(*) as cnt FROM failure_log "
+            "GROUP BY provider, reason ORDER BY cnt DESC"
+        )
+        return [{"provider": r[0], "reason": r[1], "count": r[2]} for r in cur.fetchall()]

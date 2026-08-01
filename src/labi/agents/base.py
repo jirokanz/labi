@@ -24,7 +24,7 @@ from labi.context.snapshot import ContextSnapshot
 from labi.context.update import TaskUpdate
 from labi.context.prompt_builder import PromptBuilder
 from labi.providers.adaptive_registry import AdaptiveProviderRegistry
-from labi.providers.generation import stream_generate, estimate_tokens
+from labi.providers.generation import stream_generate, estimate_tokens, ProviderCallError, _c
 
 
 class BaseAgent(ABC):
@@ -84,6 +84,10 @@ class BaseAgent(ABC):
                 )
                 self.last_provider = provider.name
                 return result
+            except ProviderCallError as e:
+                print(_c(f"   [{provider.name}] failed ({e.reason}) -- trying next provider...", "yellow"))
+                last_exc = e
+                continue
             except Exception as e:
                 last_exc = e
                 continue

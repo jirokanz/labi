@@ -78,7 +78,7 @@ MAX_OUTPUT_BYTES = 1_048_576
 
 # ---------- Terminal formatting ----------
 from labi.providers.generation import (  # noqa: E402  (see providers/generation.py docstring)
-    _c, stream_generate, format_code_block, _highlight_line, _PY_KEYWORDS, _STRING_RE,
+    _c, stream_generate, format_code_block, _highlight_line, _PY_KEYWORDS, _STRING_RE, ProviderCallError,
 )
 
 
@@ -305,6 +305,23 @@ def print_quota_summary(stats_store):
     print(_c("\n  Note: limits are last-known-good, not live-verified -- see KNOWN_QUOTAS in agent.py.", "grey"))
 
 
+def print_failure_summary(stats_store):
+    summary = stats_store.get_failure_summary()
+    print(f"\n{_c('Failure breakdown (by provider, reason):', 'bold')}")
+    if not summary:
+        print("  (no failures recorded)")
+        return
+    for row in summary:
+        print(f"  {row['provider']:12s} {row['reason']:16s} {row['count']:>4d}x")
+
+    recent = stats_store.get_recent_failures(limit=5)
+    print(f"\n{_c('Most recent failures:', 'bold')}")
+    for f in recent:
+        msg = f["message"][:80] + ("..." if len(f["message"]) > 80 else "")
+        print(f"  {_c(f['timestamp'], 'grey')} {f['provider']:10s} [{f['capability']}] "
+              f"{_c(f['reason'], 'yellow')}: {msg}")
+
+
 def build_registry():
     registry = ProviderRegistry()
 
@@ -517,6 +534,9 @@ def try_web_search_answer(goal, task_id, registry, stats_store, source_store, me
                 max_tokens=512, label="Reading sources",
                 stats_store=stats_store, capability="web_search", cost_tracker=cost_tracker,
             )
+        except ProviderCallError as e:
+            print(_c(f"   [{provider.name}] failed ({e.reason}) -- trying next provider...", "yellow"))
+            continue
         except Exception as e:
             print(f"Provider {provider.name} failed: {e}")
             continue
@@ -573,7 +593,7 @@ def main():
     session = SessionContext()
 
     while True:
-        goal = input("\nYour goal/question (or 'exit', 'providers', 'reset', 'cost', 'quota'): ").strip()
+        goal = input("\nYour goal/question (or 'exit', 'providers', 'reset', 'cost', 'quota', 'failures'): ").strip()
         if not goal:
             continue
         if goal.lower() in ("exit", "quit"):
@@ -591,6 +611,9 @@ def main():
             continue
         if goal.lower() == "quota":
             print_quota_summary(stats_store)
+            continue
+        if goal.lower() == "failures":
+            print_failure_summary(stats_store)
             continue
 
         local = dispatch_locally(goal)
@@ -669,6 +692,9 @@ def main():
                     if cost_tracker.total > 0:
                         print(_c(f"   (cost: ${cost_tracker.total:.6f})", "grey"))
                     break
+                except ProviderCallError as e:
+                    print(_c(f"   [{provider.name}] failed ({e.reason}) -- trying next provider...", "yellow"))
+                    continue
                 except Exception as e:
                     print(f"Provider {provider.name} failed: {e}")
                     continue

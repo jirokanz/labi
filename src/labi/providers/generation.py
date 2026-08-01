@@ -18,6 +18,47 @@ import time
 
 import litellm
 
+# Order matters -- checked top to bottom, first match wins. Based on
+# actual error strings observed live this session (e.g. the Gemini
+# "litellm.NotFoundError: GeminiException" 404, and litellm's own
+# RateLimitError/Timeout/AuthenticationError class names, which survive
+# into the message text even though BaseProvider.generate()/generate_stream()
+# wrap the original exception in a bare Exception(str(e)) and lose the
+# actual type -- see adaptive_registry.py).
+_FAILURE_PATTERNS = [
+    ("timeout", re.compile(r"timeout|timed out", re.IGNORECASE)),
+    ("quota_exceeded", re.compile(r"ratelimiterror|rate.?limit|429|quota|too many requests", re.IGNORECASE)),
+    ("auth_error", re.compile(r"authenticationerror|401|unauthorized|invalid api key|permission.?denied|403", re.IGNORECASE)),
+    ("not_found", re.compile(r"notfounderror|404|not found", re.IGNORECASE)),
+    ("api_error", re.compile(r"apierror|50[0-9]\b|internal server error|bad gateway|service unavailable", re.IGNORECASE)),
+]
+
+
+def classify_failure_reason(message):
+    """Pure function: given an exception's string message, return one of
+    'timeout' / 'quota_exceeded' / 'auth_error' / 'not_found' / 'api_error'
+    / 'other'. Deliberately string-based (not exception-type-based) since
+    the type information is already lost by the time this is called --
+    see the module docstring."""
+    text = message or ""
+    for reason, pattern in _FAILURE_PATTERNS:
+        if pattern.search(text):
+            return reason
+    return "other"
+
+
+class ProviderCallError(Exception):
+    """Raised by stream_generate on failure, carrying the classified
+    reason so callers looping over fallback candidates (agents/base.py's
+    _generate, agent.py's answering loop) can print/act on *why* a
+    candidate failed instead of just moving on silently."""
+
+    def __init__(self, provider_name, reason, original_message):
+        self.provider_name = provider_name
+        self.reason = reason
+        self.original_message = original_message
+        super().__init__(f"{provider_name} failed ({reason}): {original_message}")
+
 _ANSI = {
     "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
     "cyan": "\033[36m", "green": "\033[32m", "yellow": "\033[33m",
@@ -106,6 +147,7 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
     start = time.monotonic()
     success = False
     output_text = ""
+    final_error_message = None
     try:
         chunks = []
         dots = 0
@@ -124,7 +166,7 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
         success = True
         output_text = "".join(chunks)
         return output_text
-    except Exception:
+    except Exception as stream_exc:
         try:
             result = provider.generate(prompt, system_prompt, max_tokens, history)
             if render == "text":
@@ -132,8 +174,15 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
             success = True
             output_text = result["content"]
             return output_text
-        except Exception:
-            raise
+        except Exception as fallback_exc:
+            final_error_message = str(fallback_exc) or str(stream_exc)
+            reason = classify_failure_reason(final_error_message)
+            if stats_store is not None and capability is not None:
+                try:
+                    stats_store.record_failure(provider.name, capability, reason, final_error_message)
+                except Exception:
+                    pass
+            raise ProviderCallError(provider.name, reason, final_error_message) from fallback_exc
     finally:
         latency_ms = (time.monotonic() - start) * 1000
         cost = 0.0

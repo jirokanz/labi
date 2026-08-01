@@ -60,6 +60,30 @@ def test_process_returns_failed_update_when_provider_raises():
     assert "failed" in update.error.lower() or "down" in update.error.lower()
 
 
+def test_process_falls_through_to_second_provider_and_records_first_failure(tmp_path):
+    from labi.providers.stats import ProviderStatsStore
+
+    stats = ProviderStatsStore(str(tmp_path / "stats.db"))
+    registry = AdaptiveProviderRegistry()
+    # Same capability, different priority -- flaky is tried first (lower
+    # priority number), backup is the one that actually succeeds.
+    registry.register(FakeProvider("flaky", ["planning"], "unused", priority=10, should_fail=True))
+    registry.register(FakeProvider("backup", ["planning"], "1. Step one\n2. Step two", priority=20))
+    prompt_builder = PromptBuilder(ArtifactStore())
+    agent = PlannerAgent(registry, prompt_builder, stats_store=stats)
+    snapshot = ContextSnapshot(task_id="t1", goal="goal", status="pending")
+
+    update = agent.process(snapshot)
+
+    assert update.status == "planning"
+    assert update.plan == ["Step one", "Step two"]
+    assert agent.last_provider == "backup"
+
+    recorded = stats.get_recent_failures(provider="flaky")
+    assert len(recorded) == 1
+    assert recorded[0]["capability"] == "planning"
+
+
 def test_can_handle_false_once_plan_already_exists():
     agent = _agent("1. Step")
     snapshot = ContextSnapshot(task_id="t1", goal="goal", status="coding", plan=["Step"])

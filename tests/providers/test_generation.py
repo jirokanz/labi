@@ -23,3 +23,64 @@ def test_c_returns_plain_text_when_color_disabled(monkeypatch):
     import labi.providers.generation as gen
     monkeypatch.setattr(gen, "_USE_COLOR", False)
     assert _c("hello", "red") == "hello"
+
+
+# ---- Model fallback chains with failure reasons ----
+
+def test_classify_failure_reason_timeout():
+    from labi.providers.generation import classify_failure_reason
+    assert classify_failure_reason("Request timed out after 30s") == "timeout"
+
+
+def test_classify_failure_reason_quota():
+    from labi.providers.generation import classify_failure_reason
+    assert classify_failure_reason("litellm.RateLimitError: 429 Too Many Requests") == "quota_exceeded"
+
+
+def test_classify_failure_reason_auth():
+    from labi.providers.generation import classify_failure_reason
+    assert classify_failure_reason("AuthenticationError: 401 invalid api key") == "auth_error"
+
+
+def test_classify_failure_reason_not_found():
+    # The exact shape of the real Gemini failure hit live this session.
+    from labi.providers.generation import classify_failure_reason
+    assert classify_failure_reason("litellm.NotFoundError: GeminiException - 404") == "not_found"
+
+
+def test_classify_failure_reason_api_error():
+    from labi.providers.generation import classify_failure_reason
+    assert classify_failure_reason("APIError: 503 Service Unavailable") == "api_error"
+
+
+def test_classify_failure_reason_falls_back_to_other():
+    from labi.providers.generation import classify_failure_reason
+    assert classify_failure_reason("something totally unrecognized happened") == "other"
+
+
+def test_classify_failure_reason_handles_empty_message():
+    from labi.providers.generation import classify_failure_reason
+    assert classify_failure_reason("") == "other"
+    assert classify_failure_reason(None) == "other"
+
+
+def test_stream_generate_raises_provider_call_error_with_classified_reason(tmp_path):
+    from labi.providers.generation import stream_generate, ProviderCallError
+    from labi.providers.stats import ProviderStatsStore
+    from tests.fakes import FakeProvider
+
+    stats = ProviderStatsStore(str(tmp_path / "stats.db"))
+    failing = FakeProvider("flaky", ["answering"], "unused", should_fail=True)
+
+    try:
+        stream_generate(failing, "hello", stats_store=stats, capability="answering")
+        assert False, "expected ProviderCallError"
+    except ProviderCallError as e:
+        assert e.provider_name == "flaky"
+        assert e.reason == "other"  # FakeProvider raises a generic RuntimeError
+
+    # The failure should have been recorded, not just raised.
+    recent = stats.get_recent_failures(provider="flaky")
+    assert len(recent) == 1
+    assert recent[0]["reason"] == "other"
+    assert "flaky is down" in recent[0]["message"]
